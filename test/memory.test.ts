@@ -58,7 +58,7 @@ test('a turn waits for the view to be built, not for merges that bring it under 
   let release = () => {};
   const merging = new Promise<void>(resolve => { release = resolve; });
   // Each 300-byte message is its own summary; merging two goes past 512 bytes, so it needs the compactor, which holds it.
-  const memory = new Memory(dir, async input => { if (input.merge) await merging; return 'merged'; }, () => {}, 500);
+  const memory = new Memory(dir, async input => { if (input.part.l) await merging; return 'merged'; }, () => {}, 500);
   try {
     memory.append('user', 'a'.repeat(300)); memory.append('user', 'b'.repeat(300));
     await memory.settle(AbortSignal.timeout(2000));
@@ -296,6 +296,55 @@ test('the view is saved and loaded as it was, and rebuilt only when the saved on
   } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('compactions get their own view, a quarter of the budget at most, that ends at the node and between its batches only grows', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-context-'));
+  const leaves: (Compression & { view: Part[] })[] = [];
+  const memory: Memory = new Memory(dir, async input => { if (!input.part.l) leaves.push({ ...input, view: [...memory.view] }); return 's'.repeat(300); }, () => {}, 32000);
+  try {
+    for (let i = 0; i < 400; i++) { memory.append('user', `${i} ${'.'.repeat(600)}`); await memory.settle(AbortSignal.timeout(5000), true); }
+    let rewrites = 0, previous = '', total = 0, chatBatches = 0;
+    for (const [k, { context, part, view }] of leaves.entries()) {
+      const lines = context.slice('<chat>\n'.length, -'\n</chat>'.length).split('\n').filter(Boolean);
+      assert.ok(lines.every(line => /^\d+\+\d+\|s+$/.test(line)), 'built lines only, under their id+n| heads');
+      if (lines.length) assert.equal(lines.reduce((n, line) => n + Number(line.split(/[+|]/)[1]), 0), part.i, 'the lines tile the chat up to the message');
+      for (const line of lines) {
+        const [id, n] = line.split(/[+|]/).map(Number);
+        assert.ok(view.some(p => start(p) === id && 2 ** p.l <= n), `${id}+${n} is the chat's view merged further`);
+      }
+      // A batch that waits on a merge still being built can leave it a line or two over.
+      const size = bytes(lines.map(line => line.split('|')[1]).join(''));
+      assert.ok(size <= 8000 + 600, `at most a quarter of the budget, not ${size}`);
+      if (part.i > 100) total += size;
+      if (k && view.length < leaves[k - 1].view.length) { chatBatches++; assert.ok(size <= 4000 + 600, `a batch of the chat's view merges it down to an eighth, not ${size}`); }
+      if (!context.startsWith(previous)) rewrites++;
+      previous = context.slice(0, -'</chat>'.length);
+    }
+    assert.ok(memory.view.length > previous.split('\n').length, 'coarser than the chat\'s view');
+    assert.ok(chatBatches >= 2, `${chatBatches} batches of the chat's view`);
+    const mean = total / leaves.filter(c => c.part.i > 100).length;
+    assert.ok(mean > 4000 && mean < 8000, `between an eighth and a quarter of the budget on average, not ${mean}`);
+    // About one batch per 4,000 bytes of new lines (13 messages here), plus one per batch of the chat's view.
+    assert.ok(rewrites >= 20 && rewrites <= 45, `${rewrites} rewrites over ${leaves.length} compactions`);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a message\'s node starts once fewer than 8 lines before it are unbuilt, so 8 run at once on one shared view', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-ahead-'));
+  const calls: { input: Compression; release: () => void }[] = [];
+  const memory = new Memory(dir, input => new Promise(resolve => calls.push({ input, release: () => resolve('s'.repeat(300)) })), () => {}, 128000, 20);
+  try {
+    memory.append('user', `old ${'.'.repeat(600)}`); await new Promise(resolve => setTimeout(resolve, 20)); calls[0].release(); await memory.settle(AbortSignal.timeout(5000), true);
+    for (let i = 1; i <= 12; i++) memory.append('user', `${i} ${'.'.repeat(600)}`);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(calls.slice(1).map(c => c.input.part.i), [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert.equal(new Set(calls.slice(1).map(c => c.input.context)).size, 1, 'their views stop at the first unbuilt line');
+    calls[1].release();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(calls.slice(9).filter(c => !c.input.part.l).map(c => c.input.part.i), [9]);
+    calls.forEach(c => c.release());
+  } finally { calls.forEach(c => c.release()); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('next turn excludes old conversation; current tool loop and reasoning remain verbatim', async () => {
   const system: SystemMessage = { role: 'system', content: 'old system', timestamp: 0 };
   const old: UserMessage = { role: 'user', content: 'OLD FULL CONVERSATION', timestamp: 1 };
@@ -426,6 +475,23 @@ test('a new message is summarized without rescanning every built node', async ()
     await memory.settle(AbortSignal.timeout(10000), true);
     assert.equal(memory.pending, 0);
     assert.ok(lookups < count / 2, `${lookups} tree lookups for one new message over ${count}`);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('merges that keep failing are queued, so a new message never scans their level of the tree', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-queue-'));
+  // Each 300-byte message is its own line, and merging two needs the compactor, which refuses. The budget keeps the view from merging.
+  const memory = new Memory(dir, async () => { throw new Error('refused'); }, () => {}, 10_000_000, 8, 60_000);
+  const idle = async () => { while (memory.pending || memory.active) await new Promise(resolve => setTimeout(resolve, 5)); };
+  try {
+    for (let i = 0; i < 200; i++) memory.append('user', `${i} ${'.'.repeat(300)}`);
+    await idle();
+    const get = memory.tree.get;
+    let lookups = 0;
+    memory.tree.get = function (this: typeof memory.tree, key) { lookups++; return get.call(this, key); };
+    memory.append('user', `one more ${'.'.repeat(300)}`);
+    await idle();
+    assert.ok(lookups < 100, `${lookups} tree lookups for one new message, with all 100 merges failing`);
   } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

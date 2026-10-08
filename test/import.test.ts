@@ -445,7 +445,7 @@ test('an import gives the compactor the same inputs as a live chat that sent the
   // 300 lines of 500 bytes overflow the view, so merges run while later messages still wait to be summarized.
   const dir = temp(), live = temp(), old = new Memory(dir, short);
   const imported = Array.from({ length: 300 }, (_, i) => entry(`m${i}`, date, `${i} ${'imported detail '.repeat(40)}`));
-  const record = (calls: string[]) => async (input: Parameters<Compressor>[0]) => { calls.push(JSON.stringify([input.merge, input.historical, input.source, input.context])); return input.source.slice(0, 500); };
+  const record = (calls: string[]) => async (input: Parameters<Compressor>[0]) => { calls.push(JSON.stringify([input.part.l > 0, input.historical, input.source, input.context])); return input.source.slice(0, 500); };
   const fromImport: string[] = [], fromChat: string[] = [];
   let chat: Memory | undefined;
   try {

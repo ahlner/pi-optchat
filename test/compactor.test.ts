@@ -42,7 +42,7 @@ async function setup() {
   // Long enough for a cache mark, so the first 50k characters are a shared, cacheable prefix.
   const view = `<chat>\n${'0+1|user: an old remembered line\n'.repeat(2000)}</chat>`;
   // The compactor only sees sources over NODE bytes; the fake model reads just the last line.
-  const run = (source: string, context = view, signal = new AbortController().signal) => compress({ context, source: `${'x'.repeat(600)}\n${source}`, merge: false }, signal);
+  const run = (source: string, context = view, signal = new AbortController().signal) => compress({ context, source: `${'x'.repeat(600)}\n${source}`, part: { l: 0, i: 0 } }, signal);
   const settle = () => new Promise(resolve => setTimeout(resolve, 20));
   return { calls, run, settle, view };
 }

@@ -10,10 +10,13 @@ export interface Origin { source: 'claude' | 'claude-memory' | 'codex' | 'chatgp
 export interface Entry { i: number; kind: Kind; text: string; size: number; date: string; receipt?: string; origin?: Origin }
 export interface Part { l: number; i: number }
 export interface Summary extends Part { text: string; size: number }
-export interface Compression { context: string; source: string; merge: boolean; historical?: boolean }
+/** `part` is the node to build: a message's leaf, or the merge of its two halves. */
+export interface Compression { context: string; source: string; part: Part; historical?: boolean }
 export type Compressor = (input: Compression, signal: AbortSignal) => Promise<string>;
 const key = ({ l, i }: Part) => l * 2 ** 40 + i;
 const UNBUILT = '(not summarized yet: zoom it)';
+/** A message's node starts once fewer than this many lines before it are unbuilt (recipe §4). */
+const AHEAD = 8;
 export const start = ({ l, i }: Part) => i * 2 ** l;
 export const end = (part: Part) => start(part) + 2 ** part.l;
 export const bytes = (s: string) => Buffer.byteLength(s, 'utf8');
@@ -109,8 +112,10 @@ export class Memory {
   private readonly lastSeenBytes = new Map<string, number>();
   private viewBytes = 0;
   private leaves = 0;
-  /** Per level, every node below this index is built. */
-  private readonly low: number[] = [];
+  /** Every message below this one has its node built. */
+  private lowLeaf = 0;
+  /** Merges whose halves are built, so the scheduler never scans the tree for work (recipe §4). */
+  private readonly merges = new Map<number, Part>();
   private retryTimer?: ReturnType<typeof setTimeout>;
   /** The most summaries owed at once since none were last owed. */
   private peak = 0;
@@ -118,6 +123,11 @@ export class Memory {
   private stopped = false;
   /** A batch is under way: it ends once the view is down to half the budget, merging what it can at each change until then. */
   private merging = false;
+  /** The compactions' view (recipe §4): the view merged further, to between an eighth and a quarter of the budget, with the
+   * same sawtooth, so parallel compactions read it from the cache. It also merges whenever the view does. */
+  private readonly context: Part[] = [];
+  private contextBytes = 0;
+  private contextMerging = false;
   lastError?: string;
 
   constructor(readonly directory: string, private readonly compress: Compressor,
@@ -135,9 +145,12 @@ export class Memory {
       if (value.l === 0 && !this.tree.has(key(value))) this.leaves++;
       this.tree.set(key(value), { ...value, size: lineBytes(value.text) });
     }
+    for (const node of this.tree.values()) this.queueParent(node);
     // Refolding the log gives a different view than the live one, and every cache entry would miss, so the view is saved.
-    for (let i = this.load(); i < this.root.length; i++) { this.push(i); this.fit(i + 1); }
-    this.save(); this.schedule();
+    const loaded = this.load();
+    this.context.push(...this.view); this.contextBytes = this.viewBytes; this.contextMerging = true;
+    for (let i = loaded; i < this.root.length; i++) { this.push(i); this.fit(i + 1); }
+    this.fit(); this.save(); this.schedule();
   }
   private checkLog(next: string) {
     const main = dirname(next), names = readdirSync(main).filter(n => n.endsWith('.jsonl'));
@@ -176,7 +189,11 @@ export class Memory {
     return covered;
   }
   private save() { atomicWrite(join(this.directory, 'view.json'), JSON.stringify(this.view.map(p => [p.l, p.i]))); }
-  private push(i: number) { const part = { l: 0, i }; this.view.push(part); this.viewBytes += this.partBytes(part); }
+  private push(i: number) {
+    const part = { l: 0, i };
+    this.view.push(part); this.viewBytes += this.partBytes(part);
+    this.context.push(part); this.contextBytes += this.partBytes(part);
+  }
   render() { return `${VIEW_OPEN}${this.view.map(p => `${start(p)}+${2 ** p.l}|${flat(this.text(p))}`).join('\n')}\n</chat>`; }
   get ready() { return this.view.every(p => this.node(p)); }
   get pending() { return this.root.length - this.leaves; }
@@ -190,29 +207,34 @@ export class Memory {
   private owed() { return this.expectedNodes() - this.tree.size; }
   onChange(listener: () => void) { this.events.on('change', listener); return () => { this.events.off('change', listener); }; }
   /** The view line covering message `at`. The view tiles the log in order, so a binary search finds it. */
-  covering(at: number): Part | undefined {
-    for (let lo = 0, hi = this.view.length - 1; lo <= hi;) {
-      const mid = (lo + hi) >> 1, p = this.view[mid];
+  covering(at: number, view: readonly Part[] = this.view): Part | undefined {
+    for (let lo = 0, hi = view.length - 1; lo <= hi;) {
+      const mid = (lo + hi) >> 1, p = view[mid];
       if (end(p) <= at) lo = mid + 1;
       else if (start(p) > at) hi = mid - 1;
       else return p;
     }
   }
-  private visible(part: Part) { const p = this.covering(start(part)); return p?.l === part.l && p.i === part.i; }
-  /** Returns whether any lines merged. */
-  private fit(total = this.root.length) {
-    let merged = false;
-    if (this.viewBytes > this.budget) this.merging = true;
-    while (this.merging && this.viewBytes > this.budget / 2) {
-      const best = mostDue(this.view, total, part => !!this.node(part));
-      if (best < 0) break;
-      merged = true;
-      const a = this.view[best], b = this.view[best + 1];
-      const parent = { l: a.l + 1, i: a.i / 2 };
-      this.viewBytes += this.partBytes(parent) - this.partBytes(a) - this.partBytes(b);
-      this.view.splice(best, 2, parent);
+  private visible(part: Part, view: readonly Part[] = this.view) { const p = this.covering(start(part), view); return p?.l === part.l && p.i === part.i; }
+  /** Merges the most due pairs of `view`, `size` bytes, until it is at most `low` bytes or no pair can merge; returns its size. */
+  private shrink(view: Part[], size: number, low: number, total: number) {
+    for (let best: number; size > low && (best = mostDue(view, total, part => !!this.node(part))) >= 0;) {
+      const a = view[best], b = view[best + 1], parent = { l: a.l + 1, i: a.i / 2 };
+      size += this.partBytes(parent) - this.partBytes(a) - this.partBytes(b);
+      view.splice(best, 2, parent);
     }
+    return size;
+  }
+  /** Returns whether the view merged. */
+  private fit(total = this.root.length) {
+    const lines = this.view.length;
+    if (this.viewBytes > this.budget) this.merging = true;
+    if (this.merging) this.viewBytes = this.shrink(this.view, this.viewBytes, this.budget / 2, total);
     if (this.viewBytes <= this.budget / 2) this.merging = false;
+    const merged = this.view.length < lines;
+    if (merged || this.contextBytes > this.budget / 4) this.contextMerging = true;
+    if (this.contextMerging) this.contextBytes = this.shrink(this.context, this.contextBytes, this.budget / 8, total);
+    if (this.contextBytes <= this.budget / 8) this.contextMerging = false;
     const owed = this.owed();
     this.peak = owed > 0 ? Math.max(this.peak, owed) : 0;
     this.events.emit('change');
@@ -228,27 +250,27 @@ export class Memory {
     // One clock reading: skipping a part and arming its retry timer must agree on what is due.
     const now = Date.now();
     const total = this.root.length;
-    const first = this.view.find(p => !this.node(p));
-    const boundary = first ? start(first) : total;
-    for (let l = 0; 2 ** l <= total; l++) {
-      let low = this.low[l] ?? 0;
-      while (this.node({ l, i: low })) low++;
-      this.low[l] = low;
-      for (let i = low; (i + 1) * 2 ** l <= total; i++) {
-        if (this.busy.size >= this.jobs) return;
-        const part = { l, i }, id = key(part);
-        if ((l === 0 ? i : end(part)) > boundary) break;
-        if (this.node(part) || this.busy.has(id) || (this.retryAt.get(id) ?? 0) > now) continue;
-        if (l && (!this.node({ l: l - 1, i: 2 * i }) || !this.node({ l: l - 1, i: 2 * i + 1 }))) continue;
-        const promise = this.build(part).catch(error => {
-          if (this.stopped) return;
-          this.lastError = error instanceof Error ? error.message : String(error);
-          if (!this.reported.has(id)) { this.reported.add(id); this.warn(`Compactor ${start(part)}+${2 ** l}: ${this.lastError}`); }
-          this.retryAt.set(id, Date.now() + this.retryMs);
-          if (!this.retryTimer) this.retryTimer = setTimeout(() => { this.retryTimer = undefined; this.schedule(); }, this.retryMs);
-        }).finally(() => { this.busy.delete(id); this.events.emit('change'); this.schedule(); });
-        this.busy.set(id, promise);
-      }
+    const run = (part: Part) => {
+      const id = key(part);
+      if (this.busy.has(id) || (this.retryAt.get(id) ?? 0) > now) return;
+      const promise = this.build(part).catch(error => {
+        if (this.stopped) return;
+        this.lastError = error instanceof Error ? error.message : String(error);
+        if (!this.reported.has(id)) { this.reported.add(id); this.warn(`Compactor ${start(part)}+${2 ** part.l}: ${this.lastError}`); }
+        this.retryAt.set(id, Date.now() + this.retryMs);
+        if (!this.retryTimer) this.retryTimer = setTimeout(() => { this.retryTimer = undefined; this.schedule(); }, this.retryMs);
+      }).finally(() => { this.busy.delete(id); this.events.emit('change'); this.schedule(); });
+      this.busy.set(id, promise);
+    };
+    while (this.node({ l: 0, i: this.lowLeaf })) this.lowLeaf++;
+    // A message's node starts once fewer than AHEAD lines before it are unbuilt; a merge, once both halves are built.
+    for (let i = this.lowLeaf, unbuilt = 0; i < total && unbuilt < AHEAD; i++) {
+      if (this.busy.size >= this.jobs) return;
+      if (!this.node({ l: 0, i })) { unbuilt++; run({ l: 0, i }); }
+    }
+    for (const part of this.merges.values()) {
+      if (this.busy.size >= this.jobs) return;
+      run(part);
     }
     // A later failure can have a later deadline than the timer installed by the first.
     const deadlines = [...this.retryAt.values()].filter(t => t > now);
@@ -257,20 +279,32 @@ export class Memory {
   private async build(part: Part) {
     const source = part.l === 0 ? `${this.root[part.i].kind}: ${this.root[part.i].text}`
       : [0, 1].map(offset => this.text({ l: part.l - 1, i: 2 * part.i + offset })).join('\n');
-    const boundary = part.l === 0 ? start(part) : end(part);
-    const context = `<chat>\n${this.view.filter(p => end(p) <= boundary).map(p => flat(this.text(p))).join('\n')}\n</chat>`;
     const mergeSource = part.l > 0 ? [0, 1].map(offset => flat(this.text({ l: part.l - 1, i: 2 * part.i + offset }))).join('\n') : source;
-    const text = bytes(source) <= NODE ? source : (await this.compress({ context, source: mergeSource, merge: part.l > 0,
+    const text = bytes(source) <= NODE ? source : (await this.compress({ context: this.compactionView(part), source: mergeSource, part,
       historical: this.root.slice(start(part), end(part)).some(entry => !!entry.origin) }, this.controller.signal)).trim();
     if (this.stopped) return;
     if (!text) throw new Error('Compactor returned an empty summary.');
     const node = { ...part, text, size: lineBytes(text) };
     appendJson(join(this.directory, 'tree', `${localDay()}.jsonl`), node);
-    this.tree.set(key(part), node); this.retryAt.delete(key(part));
+    this.tree.set(key(part), node); this.retryAt.delete(key(part)); this.merges.delete(key(part)); this.queueParent(part);
     // A leaf is usually still in the view when built, but after a damaged tree file a saved parent can already hide it.
-    if (part.l === 0) { this.leaves++; if (this.visible(part)) this.viewBytes += node.size - UNBUILT_BYTES; }
+    if (part.l === 0) {
+      this.leaves++;
+      if (this.visible(part)) this.viewBytes += node.size - UNBUILT_BYTES;
+      if (this.visible(part, this.context)) this.contextBytes += node.size - UNBUILT_BYTES;
+    }
     if (!this.retryAt.size) this.lastError = undefined;
     if (this.fit()) this.save();
+  }
+  /** The compactions' view up to the node, and up to its first unbuilt line, so no call sees a placeholder or half a message. */
+  private compactionView(part: Part) {
+    const boundary = part.l === 0 ? start(part) : end(part), lines: string[] = [];
+    for (const p of this.context) { if (end(p) > boundary || !this.node(p)) break; lines.push(`${start(p)}+${2 ** p.l}|${flat(this.text(p))}`); }
+    return `${VIEW_OPEN}${lines.join('\n')}\n</chat>`;
+  }
+  private queueParent({ l, i }: Part) {
+    const parent = { l: l + 1, i: Math.floor(i / 2) };
+    if (!this.node(parent) && this.node({ l, i: i % 2 ? i - 1 : i + 1 })) this.merges.set(key(parent), parent);
   }
   /** Waits until every part of the view is built. As in the recipe, the view may run over budget until pending merges land. */
   async settle(signal?: AbortSignal, all = false): Promise<void> {
