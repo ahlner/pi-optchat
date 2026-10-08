@@ -10,9 +10,9 @@ The source remains upstream rather than duplicating the full article here. Its f
 
 ## Implementation mapping
 
-- `src/memory.ts`: append-only log, binary summary tree, compression scheduling, bounded view, zoom/date, and the opt-in text search over original messages (`src/tools.ts` has the tool; not in the recipe, off by default).
+- `src/memory.ts`: append-only log, binary summary tree, compression scheduling, the view (§3.2 of the 2026-10-08 revision: the most due pair, measured from its last message, merges in one batch from 128,000 down to 64,000 bytes, and the view is saved to `view.json` rather than refolded at start), zoom/date, and the opt-in text search over original messages (`src/tools.ts` has the tool; not in the recipe, off by default).
 - `src/compactor.ts`: contextual compression and size retries.
-- `src/cache.ts`: stable Anthropic cache boundaries. OpenAI requests get no marks: GPT-5.6 rejects the recipe's `prompt_cache_breakpoint` with a 400 (found by @aaaxn), so they rely on implicit prefix caching. OptChat doesn't set `reasoning.context` either: GPT-5.6 already defaults to the recipe's `"all_turns"`, and OpenAI documents it only for GPT-5.6 and GPT-6.1 Sol.
+- `src/cache.ts`: Anthropic cache marks: the view in blocks of 4 lines, one mark on the last whole block and one at the request's end, as in recipe §3.3. OpenAI requests get no marks: GPT-5.6 and GPT-6 Luna reject the recipe's `prompt_cache_breakpoint` with a 400 (found by @aaaxn), so they rely on implicit prefix caching. OptChat doesn't set `reasoning.context` either: GPT-5.6 already defaults to the recipe's `"all_turns"`, and OpenAI documents it only for GPT-5.6 and GPT-6.1 Sol.
 - `src/transcript.ts`: fresh context per parent run, current-run tool loop retained. The previous completed exchange is also retained in full text (left out if over 16,000 bytes by default), an intentional addition to the summary-only recipe for conversational continuity.
 - `src/agents.ts`: asynchronous Pi SDK children and automatic completion reports.
 - `src/settings.ts`: per-profile settings for the departures from the recipe. Defaults are the recipe's (one subagent level, no memory search), except the previous exchange (on) and the summary size tolerance (640 bytes, against the recipe's strict 512).

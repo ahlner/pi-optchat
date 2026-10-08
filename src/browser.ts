@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { atomicWrite } from './profiles.ts';
+import { atomicWrite } from './memory.ts';
 import { type Memory } from './memory.ts';
 
 // One self-contained, read-only HTML snapshot of a profile's memory.

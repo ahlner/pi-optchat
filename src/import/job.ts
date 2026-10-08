@@ -2,7 +2,7 @@ import { existsSync, readFileSync, rmSync, cpSync, mkdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Memory, bytes, isEntry, type Entry, type Compressor } from '../memory.ts';
-import { atomicWrite } from '../profiles.ts';
+import { atomicWrite } from '../memory.ts';
 import { record } from '../cache.ts';
 import { copyKey, type ImportedEntry } from './sources.ts';
 
