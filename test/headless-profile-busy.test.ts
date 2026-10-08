@@ -83,6 +83,27 @@ test('a headless session whose profile is busy degrades to a plain session inste
   }
 });
 
+test('a non-tui session whose bound profile was deleted falls back instead of faulting', async () => {
+  // A session resumes with a binding to a profile that no longer exists on disk
+  // (e.g. the user deleted ~/.optchat/profiles/<name> while the session was closed).
+  // session_start must not fault; it should fall back like a fresh session would.
+  const dir = mkdtempSync('/tmp/oc-h-');
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = join(dir, 'home');
+  let session: Awaited<ReturnType<typeof start>>['session'] | undefined;
+  try {
+    const rpc = await start(dir, 'rpc', 'gone');
+    session = rpc.session;
+    assert.deepEqual(rpc.errors, [], 'session_start must not fault when the bound profile was deleted');
+    const bindings = rpc.manager.getEntries().filter(e => e.type === 'custom' && e.customType === 'optchat.profile').map(e => (e as any).data);
+    assert.deepEqual(bindings, [{ name: 'gone' }, { name: 'default' }], 'the original binding stays and the session falls back to a fresh default profile: ' + JSON.stringify(bindings));
+  } finally {
+    if (session) { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a non-tui session skips a locked profile and picks a free one instead of degrading into a loop', async () => {
   // The IDE loop: lastProfile is locked by the parent (terminal Pi), so the fallback
   // must not keep returning it — /optchat profile would re-open the same busy profile.
@@ -114,4 +135,3 @@ test('a non-tui session skips a locked profile and picks a free one instead of d
     rmSync(dir, { recursive: true, force: true });
   }
 });
-

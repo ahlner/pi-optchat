@@ -225,7 +225,18 @@ export default function optchat(pi: ExtensionAPI) {
         if (!name) { status(ctx); return; }
         try { await openProfile(name, ctx); break; }
         catch (error) {
-          if (!(error instanceof ProfileBusyError)) throw error;
+          if (!(error instanceof ProfileBusyError)) {
+            // The bound profile may have been deleted on disk (e.g. `rm -rf ~/.optchat/profiles/…`).
+            // In non-TUI modes that must not kill the session — fall back to a free profile instead.
+            // `settled` sessions are excluded only in TUI, where the user can pick another
+          // profile interactively; in non-TUI hosts (pi -p, ACP) there is no picker, so a
+          // deleted profile must fall back instead of faulting — the prompt would hang otherwise.
+          if (error instanceof Error && /does not exist/.test(error.message) && name === boundName && (!settled || ctx.mode !== 'tui')) {
+              name = await chooseProfile(ctx);
+              continue;
+            }
+            throw error;
+          }
           if (ctx.mode !== 'tui') {
             // Headless child (detached runner / pi -p): the profile is locked by its
             // parent window. Degrade to a plain Pi session instead of faulting —
@@ -261,9 +272,11 @@ export default function optchat(pi: ExtensionAPI) {
       return { action: 'handled' };
     }
     if (!active) {
-      if (ctx.hasUI) { ctx.ui.notify(fault ?? 'Select a profile with /optchat profile before chatting.', 'error'); return { action: 'handled' }; }
-      // Headless (no UI): never absorb the prompt. Degrade to a plain Pi session so
-      // detached runners and pi -p still run; optchat features stay off.
+      // Non-TUI hosts (headless, ACP/rpc): never absorb the prompt. Degrade to a plain Pi
+      // session so detached runners, pi -p and IDE sessions still run; optchat features stay
+      // off. An RPC host has a real uiContext, but blocking it here hangs the IDE — notifying
+      // alone cannot unblock, because /optchat profile may fault again in the same cycle.
+      if (ctx.mode === 'tui') { ctx.ui.notify(fault ?? 'Select a profile with /optchat profile before chatting.', 'error'); return { action: 'handled' }; }
       return { action: 'continue' };
     }
     if (importing || pendingImport(active.dir)) { ctx.ui.notify('This profile has an import in progress. Use /optchat import to resume or discard it, or switch profiles.', 'info'); return { action: 'handled' }; }
