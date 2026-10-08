@@ -136,7 +136,14 @@ export default function optchat(pi: ExtensionAPI) {
   };
   const CONNECT = 'Start a connected subagent conversation here', BACK = 'Back';
   const chooseProfile = async (ctx: ExtensionContext): Promise<string | undefined> => {
-    if (!ctx.hasUI) return undefined;
+    if (!ctx.hasUI) {
+      const names = listProfiles();
+      const fallback = lastProfile() ?? (names.length === 1 ? names[0] : undefined);
+      if (fallback) return fallback;
+      // First headless use: create a default profile instead of silently absorbing input.
+      createProfile('default');
+      return 'default';
+    }
     const names = listProfiles(), last = lastProfile();
     if (last) names.sort((a, b) => Number(b === last) - Number(a === last));
     const selected = await ctx.ui.select('OptChat profile', [...names, '+ Create profile']);
@@ -239,7 +246,12 @@ export default function optchat(pi: ExtensionAPI) {
       } catch (error) { ctx.ui.notify(errorText(error), 'error'); ctx.ui.setEditorText(event.text); }
       return { action: 'handled' };
     }
-    if (!active) { ctx.ui.notify(fault ?? 'Select a profile with /optchat profile before chatting.', 'error'); return { action: 'handled' }; }
+    if (!active) {
+      if (ctx.hasUI) { ctx.ui.notify(fault ?? 'Select a profile with /optchat profile before chatting.', 'error'); return { action: 'handled' }; }
+      // Headless (no UI): never absorb the prompt. Degrade to a plain Pi session so
+      // detached runners and pi -p still run; optchat features stay off.
+      return { action: 'continue' };
+    }
     if (importing || pendingImport(active.dir)) { ctx.ui.notify('This profile has an import in progress. Use /optchat import to resume or discard it, or switch profiles.', 'info'); return { action: 'handled' }; }
     if (event.source !== 'extension') {
       try { active.inbox.record(event.text); }
