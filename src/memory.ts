@@ -5,6 +5,10 @@ import { EventEmitter } from 'node:events';
 export const NODE = 512;
 export const VIEW = 128_000;
 export const CAP = 30_000;
+/** A message over this many bytes is a big paste or tool output: its leaf line says so, so it doesn't pass for a one-liner. */
+export const BIG = 8_000;
+/** The most characters one zoom into a message returns, so a page stays under the tool output CAP instead of losing its middle. */
+export const PAGE = 25_000;
 export type Kind = 'user' | 'talk' | 'tool' | 'echo' | 'note';
 export interface Origin { source: 'claude' | 'claude-memory' | 'codex' | 'chatgpt'; conversation: string; message: string; title: string; project?: string }
 export interface Entry { i: number; kind: Kind; text: string; size: number; date: string; receipt?: string; origin?: Origin }
@@ -29,6 +33,12 @@ export function cap(text: string, limit = CAP) {
   const head = text.slice(0, /[\ud800-\udbff]/.test(text[half - 1]) ? half - 1 : half);
   const tail = text.slice(/[\udc00-\udfff]/.test(text[text.length - half]) ? text.length - half + 1 : text.length - half);
   return head + notice(text.length - head.length - tail.length) + tail;
+}
+/** `echo: …` becomes `echo (31 KB): …`; a summary that doesn't open with a kind gets the size in front. */
+export function sized(entry: Entry, text: string) {
+  if (entry.size <= BIG) return text;
+  const tag = `(${Math.round(entry.size / 1000)} KB)`;
+  return /^\w+: /.test(text) ? text.replace(/^\w+/, `$& ${tag}`) : `${tag} ${text}`;
 }
 export function localDay(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -108,7 +118,7 @@ export class Memory {
       if (!isSummary(value) || value.l < 0 || value.i < 0 || end(value) > this.root.length)
         throw new Error('Invalid OptChat summary record.');
       if (value.l === 0 && !this.tree.has(key(value))) this.leaves++;
-      this.tree.set(key(value), { ...value, size: lineBytes(value.text) });
+      this.tree.set(key(value), this.shown(value, value.text));
     }
     // Fold history in order; do not retile the entire log on each turn.
     for (let i = 0; i < this.root.length; i++) { this.push(i); this.fit(i + 1); }
@@ -128,6 +138,11 @@ export class Memory {
     return entry;
   }
   node(part: Part) { return this.tree.get(key(part)); }
+  /** The tree files keep the summary as written; the size tag is added on load, so older trees get it too. */
+  private shown(part: Part, summary: string): Summary {
+    const text = part.l ? summary : sized(this.root[part.i], summary);
+    return { l: part.l, i: part.i, text, size: lineBytes(text) };
+  }
   private text(part: Part) { return this.node(part)?.text ?? UNBUILT; }
   private partBytes(part: Part) { return this.node(part)?.size ?? UNBUILT_BYTES; }
   private push(i: number) { const part = { l: 0, i }; this.view.push(part); this.viewBytes += this.partBytes(part); }
@@ -218,8 +233,8 @@ export class Memory {
       historical: this.root.slice(start(part), end(part)).some(entry => !!entry.origin) }, this.controller.signal)).trim();
     if (this.stopped) return;
     if (!text) throw new Error('Compactor returned an empty summary.');
-    const node = { ...part, text, size: lineBytes(text) };
-    appendJson(join(this.directory, 'tree', `${localDay()}.jsonl`), node);
+    appendJson(join(this.directory, 'tree', `${localDay()}.jsonl`), { ...part, text, size: lineBytes(text) });
+    const node = this.shown(part, text);
     this.tree.set(key(part), node); this.retryAt.delete(key(part));
     // A leaf is usually still in the view when built, but after a damaged tree file a saved parent can already hide it.
     if (part.l === 0) { this.leaves++; if (this.visible(part)) this.viewBytes += node.size - UNBUILT_BYTES; }
@@ -243,10 +258,23 @@ export class Memory {
     for (let n = this.root.length; n > 0; n = Math.floor(n / 2)) count += n;
     return count;
   }
-  zoom(id: number, n: number) {
+  /** n = 1 gives the message whole, or, when it is longer than `limit` or `offset` is given, the page of up to `limit` characters from `offset`. */
+  zoom(id: number, n: number, offset?: number, limit = PAGE) {
     if (!Number.isSafeInteger(id) || id < 0 || !Number.isSafeInteger(n) || n < 1 || !Number.isInteger(Math.log2(n)) || id % n || id + n > this.root.length)
       throw new Error(`No line ${id}+${n}.`);
-    if (n === 1) { const entry = this.root[id]; return `${id}+0|${entry.kind}: ${entry.text}`; }
+    if (n === 1) {
+      const { kind, text } = this.root[id], page = Math.min(limit, PAGE);
+      if (!Number.isSafeInteger(page) || page < 1) throw new Error('limit must be a positive integer.');
+      if (offset === undefined && text.length <= page) return `${id}+0|${kind}: ${text}`;
+      if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0 || offset >= Math.max(1, text.length)))
+        throw new Error(`Message ${id} has ${text.length} characters; offset must be 0 to ${Math.max(0, text.length - 1)}.`);
+      // Never split a surrogate pair: a page starts on its first half and ends after its second.
+      const from = /[\udc00-\udfff]/.test(text[offset ?? 0] ?? '') ? (offset ?? 0) - 1 : offset ?? 0;
+      let to = Math.min(text.length, from + page);
+      if (to < text.length && /[\ud800-\udbff]/.test(text[to - 1])) to--;
+      return `${id}+0|${kind}: ${text.slice(from, to)}\n[showing characters ${from}-${to} of ${text.length}${to < text.length ? `; next page: offset ${to}` : ''}]`;
+    }
+    if (offset !== undefined) throw new Error('offset and limit page one message: use them with n = 1.');
     const l = Math.log2(n) - 1, i = 2 * id / n;
     return [0, 1].map(offset => {
       const part = { l, i: i + offset }, node = this.node(part);
