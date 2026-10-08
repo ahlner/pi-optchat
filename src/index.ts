@@ -218,7 +218,14 @@ export default function optchat(pi: ExtensionAPI) {
         if (!name) { status(ctx); return; }
         try { await openProfile(name, ctx); break; }
         catch (error) {
-          if (!(error instanceof ProfileBusyError) || ctx.mode !== 'tui') throw error;
+          if (!(error instanceof ProfileBusyError)) throw error;
+          if (ctx.mode !== 'tui') {
+            // Headless child (detached runner / pi -p): the profile is locked by its
+            // parent window. Degrade to a plain Pi session instead of faulting —
+            // otherwise session_start throws and the runner's prompt is aborted.
+            status(ctx);
+            return;
+          }
           // A resumed conversation already belongs to this profile, so another profile needs a new session (/optchat profile).
           const choice = await ctx.ui.select(`${name} is open in another window\n${error.owner}`, settled ? [CONNECT] : [CONNECT, BACK]);
           if (choice === CONNECT) { remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text)); fault = undefined; break; }
@@ -271,6 +278,7 @@ export default function optchat(pi: ExtensionAPI) {
     if (active && !runStarted) startRun(ctx);
   });
   pi.on('before_agent_start', (event, ctx) => {
+    if (!active) return; // Headless child without a profile: leave Pi's own prompt untouched.
     startRun(ctx);
     const a = required();
     // Pi's own prompt sections (AGENTS.md files, skills, cwd) stay; the profile's instructions go last.
@@ -305,6 +313,7 @@ export default function optchat(pi: ExtensionAPI) {
   });
   pi.on('context_with_system', async (event, ctx) => {
     try {
+      if (!active) return; // Headless child without a profile: pass context through unmodified.
       const a = required();
       if (importing || pendingImport(a.dir)) throw new Error('Profile is unavailable while importing.');
       if (fault) throw new Error(fault);
