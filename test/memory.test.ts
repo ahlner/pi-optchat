@@ -511,6 +511,25 @@ test('merges that keep failing are queued, so a new message never scans their le
   } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a message whose node keeps failing is queued, so later messages never scan the leaves after it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-stuck-leaf-'));
+  // Message 0 needs the compactor, which refuses it; every later message is its own line and their merges succeed.
+  const memory = new Memory(dir, async input => { if (input.part.l === 0) throw new Error('refused'); return 's'.repeat(100); }, () => {}, 10_000_000, 8, 60_000);
+  const idle = async () => { while (memory.pending > 1 || memory.active) await new Promise(resolve => setTimeout(resolve, 5)); };
+  try {
+    memory.append('user', `0 ${'.'.repeat(600)}`);
+    for (let i = 1; i < 200; i++) memory.append('user', `${i} ${'.'.repeat(300)}`);
+    await idle();
+    assert.equal(memory.pending, 1, 'only message 0 is unbuilt');
+    const get = memory.tree.get;
+    let lookups = 0;
+    memory.tree.get = function (this: typeof memory.tree, key) { lookups++; return get.call(this, key); };
+    memory.append('user', `one more ${'.'.repeat(300)}`);
+    await idle();
+    assert.ok(lookups < 100, `${lookups} tree lookups for one new message, with message 0 failing`);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('an expanded /skill: command claims the input it came from, and only that one', () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-inbox-'));
   try {

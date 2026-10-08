@@ -58,6 +58,40 @@ export function mostDue(view: readonly Part[], total: number, built: (part: Part
   }
   return best;
 }
+/** A view (recipe §3.2): lines that tile the log, oldest first. It grows a line per message and, once over `high` bytes or when
+ * forced, merges its most due pairs in one batch down to `low`, merging what it can at each change until then. */
+class Sawtooth {
+  readonly parts: Part[] = [];
+  private measured = 0;
+  private merging = false;
+  constructor(private readonly high: number, private readonly low: number, private readonly node: (part: Part) => Summary | undefined) {}
+  private lineSize(part: Part) { return this.node(part)?.size ?? UNBUILT_BYTES; }
+  get size() { return this.measured; }
+  push(part: Part) { this.parts.push(part); this.measured += this.lineSize(part); }
+  /** The line covering message `at`. The lines tile the log in order, so a binary search finds it. */
+  covering(at: number): Part | undefined {
+    for (let lo = 0, hi = this.parts.length - 1; lo <= hi;) {
+      const mid = (lo + hi) >> 1, p = this.parts[mid];
+      if (end(p) <= at) lo = mid + 1;
+      else if (start(p) > at) hi = mid - 1;
+      else return p;
+    }
+  }
+  /** A message got its node. Its line is usually still shown, but after a damaged tree file a saved parent can already hide it. */
+  built(i: number) { if (this.covering(i)?.l === 0) this.measured += this.lineSize({ l: 0, i }) - UNBUILT_BYTES; }
+  /** Returns whether any lines merged. */
+  fit(total: number, force = false) {
+    const lines = this.parts.length;
+    if (force || this.measured > this.high) this.merging = true;
+    for (let best: number; this.merging && this.measured > this.low && (best = mostDue(this.parts, total, part => !!this.node(part))) >= 0;) {
+      const a = this.parts[best], b = this.parts[best + 1], parent = { l: a.l + 1, i: a.i / 2 };
+      this.measured += this.lineSize(parent) - this.lineSize(a) - this.lineSize(b);
+      this.parts.splice(best, 2, parent);
+    }
+    if (this.measured <= this.low) this.merging = false;
+    return this.parts.length < lines;
+  }
+}
 const otherWriter = (file: string) => new Error(`Another process wrote ${file}. Close every other Pi on this profile and restart Pi; nothing was written.`);
 /** With `size`, refuses to append unless the file still has that size. A last line left without its newline is ended first. Returns the new size. */
 export function appendJson(file: string, value: unknown, size?: number) {
@@ -99,40 +133,35 @@ function isSummary(value: unknown): value is Summary {
 }
 
 /** The log is authoritative. The tree and the view follow the recipe: the view grows a line per message and, once it passes
- * `budget`, merges its most due pairs in one batch down to half of it, so between batches it only grows at its end. */
+ * `budget`, merges its most due pairs in one batch down to half of it, so between batches it only grows at its end.
+ * Compactions get their own view (recipe §4): the chat's merged further, to between an eighth and a quarter of the budget,
+ * and again whenever the chat's merges, so parallel compactions read it from the cache. */
 export class Memory {
   readonly root: Entry[] = [];
   readonly tree = new Map<number, Summary>();
-  readonly view: Part[] = [];
   private readonly events = new EventEmitter();
   private readonly controller = new AbortController();
   private readonly busy = new Map<number, Promise<void>>();
   private readonly retryAt = new Map<number, number>();
   private readonly reported = new Set<number>();
   private readonly lastSeenBytes = new Map<string, number>();
-  private viewBytes = 0;
-  private leaves = 0;
-  /** Every message below this one has its node built. */
-  private lowLeaf = 0;
-  /** Merges whose halves are built, so the scheduler never scans the tree for work (recipe §4). */
+  /** Messages without their node, and merges whose halves are built, oldest first, so the scheduler never scans the tree for work (recipe §4). */
+  private readonly unbuilt = new Set<number>();
   private readonly merges = new Map<number, Part>();
   private retryTimer?: ReturnType<typeof setTimeout>;
   /** The most summaries owed at once since none were last owed. */
   private peak = 0;
   private scheduled = false;
   private stopped = false;
-  /** A batch is under way: it ends once the view is down to half the budget, merging what it can at each change until then. */
-  private merging = false;
-  /** The compactions' view (recipe §4): the view merged further, to between an eighth and a quarter of the budget, with the
-   * same sawtooth, so parallel compactions read it from the cache. It also merges whenever the view does. */
-  private readonly context: Part[] = [];
-  private contextBytes = 0;
-  private contextMerging = false;
+  private readonly chat: Sawtooth;
+  private readonly compaction: Sawtooth;
   lastError?: string;
 
   constructor(readonly directory: string, private readonly compress: Compressor,
     private readonly warn: (s: string) => void = console.error,
     readonly budget = VIEW, private readonly jobs = 8, private readonly retryMs = 10_000) {
+    this.chat = new Sawtooth(budget, budget / 2, part => this.node(part));
+    this.compaction = new Sawtooth(budget / 4, budget / 8, part => this.node(part));
     for (const sub of ['main', 'tree']) mkdirSync(join(directory, sub), { recursive: true, mode: 0o700 });
     const main = join(directory, 'main'), log = records(main, warn);
     for (const name of readdirSync(main).filter(n => n.endsWith('.jsonl'))) this.lastSeenBytes.set(join(main, name), statSync(join(main, name)).size);
@@ -142,13 +171,14 @@ export class Memory {
     for (const value of records(join(directory, 'tree'), warn)) {
       if (!isSummary(value) || value.l < 0 || value.i < 0 || end(value) > this.root.length)
         throw new Error('Invalid OptChat summary record.');
-      if (value.l === 0 && !this.tree.has(key(value))) this.leaves++;
       this.tree.set(key(value), { ...value, size: lineBytes(value.text) });
     }
     for (const node of this.tree.values()) this.queueParent(node);
+    for (let i = 0; i < this.root.length; i++) if (!this.node({ l: 0, i })) this.unbuilt.add(i);
     // Refolding the log gives a different view than the live one, and every cache entry would miss, so the view is saved.
     const loaded = this.load();
-    this.context.push(...this.view); this.contextBytes = this.viewBytes; this.contextMerging = true;
+    for (const part of this.view) this.compaction.push(part);
+    this.compaction.fit(loaded, true);
     for (let i = loaded; i < this.root.length; i++) { this.push(i); this.fit(i + 1); }
     this.fit(); this.save(); this.schedule();
   }
@@ -167,7 +197,6 @@ export class Memory {
   }
   node(part: Part) { return this.tree.get(key(part)); }
   private text(part: Part) { return this.node(part)?.text ?? UNBUILT; }
-  private partBytes(part: Part) { return this.node(part)?.size ?? UNBUILT_BYTES; }
   /** Takes the saved view if it still tiles the log from the start, and returns how many messages it covers. */
   private load() {
     const file = join(this.directory, 'view.json');
@@ -185,7 +214,7 @@ export class Memory {
         return rebuild();
       parts.push(part); covered = end(part);
     }
-    for (const part of parts) { this.view.push(part); this.viewBytes += this.partBytes(part); }
+    for (const part of parts) this.chat.push(part);
     return covered;
   }
   /** Saved when it merges: a view that only grew is the saved one plus a line per later message, as `load` replays it.
@@ -196,14 +225,15 @@ export class Memory {
   }
   private push(i: number) {
     const part = { l: 0, i };
-    this.view.push(part); this.viewBytes += this.partBytes(part);
-    this.context.push(part); this.contextBytes += this.partBytes(part);
+    this.chat.push(part); this.compaction.push(part);
+    if (!this.node(part)) this.unbuilt.add(i);
   }
+  get view(): readonly Part[] { return this.chat.parts; }
   render() { return `${VIEW_OPEN}${this.view.map(p => `${start(p)}+${2 ** p.l}|${flat(this.text(p))}`).join('\n')}\n</chat>`; }
   get ready() { return this.view.every(p => this.node(p)); }
-  get pending() { return this.root.length - this.leaves; }
+  get pending() { return this.unbuilt.size; }
   get active() { return this.busy.size; }
-  get size() { return this.viewBytes; }
+  get size() { return this.chat.size; }
   /** Summaries built out of the backlog since it was last empty, and when the next failed one is retried. */
   progress(now = Date.now()) {
     const due = Math.min(...[...this.retryAt.values()].filter(t => t > now));
@@ -211,35 +241,12 @@ export class Memory {
   }
   private owed() { return this.expectedNodes() - this.tree.size; }
   onChange(listener: () => void) { this.events.on('change', listener); return () => { this.events.off('change', listener); }; }
-  /** The view line covering message `at`. The view tiles the log in order, so a binary search finds it. */
-  covering(at: number, view: readonly Part[] = this.view): Part | undefined {
-    for (let lo = 0, hi = view.length - 1; lo <= hi;) {
-      const mid = (lo + hi) >> 1, p = view[mid];
-      if (end(p) <= at) lo = mid + 1;
-      else if (start(p) > at) hi = mid - 1;
-      else return p;
-    }
-  }
-  private visible(part: Part, view: readonly Part[] = this.view) { const p = this.covering(start(part), view); return p?.l === part.l && p.i === part.i; }
-  /** Merges the most due pairs of `view`, `size` bytes, until it is at most `low` bytes or no pair can merge; returns its size. */
-  private shrink(view: Part[], size: number, low: number, total: number) {
-    for (let best: number; size > low && (best = mostDue(view, total, part => !!this.node(part))) >= 0;) {
-      const a = view[best], b = view[best + 1], parent = { l: a.l + 1, i: a.i / 2 };
-      size += this.partBytes(parent) - this.partBytes(a) - this.partBytes(b);
-      view.splice(best, 2, parent);
-    }
-    return size;
-  }
-  /** Returns whether the view merged. */
+  /** The view line covering message `at`. */
+  covering(at: number) { return this.chat.covering(at); }
+  /** Returns whether the chat's view merged. */
   private fit(total = this.root.length) {
-    const lines = this.view.length;
-    if (this.viewBytes > this.budget) this.merging = true;
-    if (this.merging) this.viewBytes = this.shrink(this.view, this.viewBytes, this.budget / 2, total);
-    if (this.viewBytes <= this.budget / 2) this.merging = false;
-    const merged = this.view.length < lines;
-    if (merged || this.contextBytes > this.budget / 4) this.contextMerging = true;
-    if (this.contextMerging) this.contextBytes = this.shrink(this.context, this.contextBytes, this.budget / 8, total);
-    if (this.contextBytes <= this.budget / 8) this.contextMerging = false;
+    const merged = this.chat.fit(total);
+    this.compaction.fit(total, merged);
     const owed = this.owed();
     this.peak = owed > 0 ? Math.max(this.peak, owed) : 0;
     this.events.emit('change');
@@ -254,7 +261,6 @@ export class Memory {
     if (this.stopped) return;
     // One clock reading: skipping a part and arming its retry timer must agree on what is due.
     const now = Date.now();
-    const total = this.root.length;
     const run = (part: Part) => {
       const id = key(part);
       if (this.busy.has(id) || (this.retryAt.get(id) ?? 0) > now) return;
@@ -267,11 +273,12 @@ export class Memory {
       }).finally(() => { this.busy.delete(id); this.events.emit('change'); this.schedule(); });
       this.busy.set(id, promise);
     };
-    while (this.node({ l: 0, i: this.lowLeaf })) this.lowLeaf++;
     // A message's node starts once fewer than AHEAD lines before it are unbuilt; a merge, once both halves are built.
-    for (let i = this.lowLeaf, unbuilt = 0; i < total && unbuilt < AHEAD; i++) {
+    let ahead = 0;
+    for (const i of this.unbuilt) {
+      if (ahead++ === AHEAD) break;
       if (this.busy.size >= this.jobs) return;
-      if (!this.node({ l: 0, i })) { unbuilt++; run({ l: 0, i }); }
+      run({ l: 0, i });
     }
     for (const part of this.merges.values()) {
       if (this.busy.size >= this.jobs) return;
@@ -292,19 +299,14 @@ export class Memory {
     const node = { ...part, text, size: lineBytes(text) };
     appendJson(join(this.directory, 'tree', `${localDay()}.jsonl`), node);
     this.tree.set(key(part), node); this.retryAt.delete(key(part)); this.merges.delete(key(part)); this.queueParent(part);
-    // A leaf is usually still in the view when built, but after a damaged tree file a saved parent can already hide it.
-    if (part.l === 0) {
-      this.leaves++;
-      if (this.visible(part)) this.viewBytes += node.size - UNBUILT_BYTES;
-      if (this.visible(part, this.context)) this.contextBytes += node.size - UNBUILT_BYTES;
-    }
+    if (!part.l) { this.unbuilt.delete(part.i); this.chat.built(part.i); this.compaction.built(part.i); }
     if (!this.retryAt.size) this.lastError = undefined;
     if (this.fit()) this.save();
   }
   /** The compactions' view up to the node, and up to its first unbuilt line, so no call sees a placeholder or half a message. */
   private compactionView(part: Part) {
     const boundary = part.l === 0 ? start(part) : end(part), lines: string[] = [];
-    for (const p of this.context) { if (end(p) > boundary || !this.node(p)) break; lines.push(`${start(p)}+${2 ** p.l}|${flat(this.text(p))}`); }
+    for (const p of this.compaction.parts) { if (end(p) > boundary || !this.node(p)) break; lines.push(`${start(p)}+${2 ** p.l}|${flat(this.text(p))}`); }
     return `${VIEW_OPEN}${lines.join('\n')}\n</chat>`;
   }
   private queueParent({ l, i }: Part) {
