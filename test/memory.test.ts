@@ -280,7 +280,9 @@ test('the view is saved and loaded as it was, and rebuilt only when the saved on
   try {
     for (let i = 0; i < 16; i++) { memory.append('user', `${i} ${'.'.repeat(600)}`); await memory.settle(AbortSignal.timeout(5000), true); }
     const live = parts(memory);
-    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'view.json'), 'utf8')), live);
+    await memory.close();
+    memory = new Memory(dir, compress, () => {}, 3000);
+    assert.deepEqual(parts(memory), live, 'the saved view plus a line per later message is the live view');
     await memory.close();
     // A view the fold would not produce, but a valid tiling: loading keeps it rather than refolding.
     const saved = [[3, 0], [2, 2], [0, 12], [0, 13], [0, 14], [0, 15]];
@@ -289,6 +291,7 @@ test('the view is saved and loaded as it was, and rebuilt only when the saved on
     assert.deepEqual(parts(memory), saved);
     memory.append('user', 'one more');
     assert.deepEqual(parts(memory), [...saved, [0, 16]]);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'view.json'), 'utf8')), saved, 'a line added without a merge is not saved');
     await memory.close();
     const warnings: string[] = [];
     writeFileSync(join(dir, 'view.json'), JSON.stringify([[0, 0], [0, 2]]));
@@ -346,6 +349,19 @@ test('a message\'s node starts once fewer than 8 lines before it are unbuilt, so
     assert.deepEqual(calls.slice(9).filter(c => !c.input.part.l).map(c => c.input.part.i), [9]);
     calls.forEach(c => c.release());
   } finally { calls.forEach(c => c.release()); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a view that cannot be saved only warns, since the log stays authoritative', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-unsaved-view-')), warnings: string[] = [];
+  mkdirSync(join(dir, 'view.json'), { recursive: true });
+  const memory = new Memory(dir, async () => 's'.repeat(300), text => warnings.push(text), 3000);
+  try {
+    for (let i = 0; i < 16; i++) { memory.append('user', `${i} ${'.'.repeat(600)}`); await memory.settle(AbortSignal.timeout(5000), true); }
+    assert.equal(memory.root.length, 16);
+    assert.ok(memory.view.some(p => p.l > 0), 'the view merged');
+    assert.match(warnings.join('\n'), /Could not save the memory view/);
+    assert.equal(memory.lastError, undefined);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('next turn excludes old conversation; current tool loop and reasoning remain verbatim', async () => {
@@ -495,6 +511,25 @@ test('merges that keep failing are queued, so a new message never scans their le
     memory.append('user', `one more ${'.'.repeat(300)}`);
     await idle();
     assert.ok(lookups < 100, `${lookups} tree lookups for one new message, with all 100 merges failing`);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a message whose node keeps failing is queued, so later messages never scan the leaves after it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-stuck-leaf-'));
+  // Message 0 needs the compactor, which refuses it; every later message is its own line and their merges succeed.
+  const memory = new Memory(dir, async input => { if (input.part.l === 0) throw new Error('refused'); return 's'.repeat(100); }, () => {}, 10_000_000, 8, 60_000);
+  const idle = async () => { while (memory.pending > 1 || memory.active) await new Promise(resolve => setTimeout(resolve, 5)); };
+  try {
+    memory.append('user', `0 ${'.'.repeat(600)}`);
+    for (let i = 1; i < 200; i++) memory.append('user', `${i} ${'.'.repeat(300)}`);
+    await idle();
+    assert.equal(memory.pending, 1, 'only message 0 is unbuilt');
+    const get = memory.tree.get;
+    let lookups = 0;
+    memory.tree.get = function (this: typeof memory.tree, key) { lookups++; return get.call(this, key); };
+    memory.append('user', `one more ${'.'.repeat(300)}`);
+    await idle();
+    assert.ok(lookups < 100, `${lookups} tree lookups for one new message, with message 0 failing`);
   } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
