@@ -43,6 +43,7 @@ test('zoom pages a long message without splitting characters, and leaves short o
     assert.equal(text, long);
     assert.match(memory.zoom(1, 1, PAGE), /^1\+0\|user: 😀b/);
     assert.match(memory.zoom(1, 1, 10, 5), /^1\+0\|user: a{5}\n\[showing characters 10-15 of 65001; next page: offset 15\]$/);
+    assert.match(memory.zoom(1, 1, PAGE, 1), /^1\+0\|user: \u{1F600}\n\[showing characters 24999-25001 of 65001; next page: offset 25001\]$/u);
     assert.throws(() => memory.zoom(1, 1, long.length), /offset must be 0 to 65000/);
     assert.throws(() => memory.zoom(0, 2, 0), /n = 1/);
   });

@@ -271,7 +271,8 @@ export class Memory {
       // Never split a surrogate pair: a page starts on its first half and ends after its second.
       const from = /[\udc00-\udfff]/.test(text[offset ?? 0] ?? '') ? (offset ?? 0) - 1 : offset ?? 0;
       let to = Math.min(text.length, from + page);
-      if (to < text.length && /[\ud800-\udbff]/.test(text[to - 1])) to--;
+      // A one-unit page on a pair takes the whole pair, so the next offset always moves forward.
+      if (to < text.length && /[\ud800-\udbff]/.test(text[to - 1])) to += to - 1 === from ? 1 : -1;
       return `${id}+0|${kind}: ${text.slice(from, to)}\n[showing characters ${from}-${to} of ${text.length}${to < text.length ? `; next page: offset ${to}` : ''}]`;
     }
     if (offset !== undefined) throw new Error('offset and limit page one message: use them with n = 1.');
