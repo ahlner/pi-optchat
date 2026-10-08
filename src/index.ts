@@ -9,7 +9,7 @@ import { parseSkillBlock, type ExtensionAPI, type ExtensionContext, type Extensi
 import { Type } from 'typebox';
 import { Memory } from './memory.ts';
 import { createCompressor } from './compactor.ts';
-import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
+import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, probeProfile, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
 import { MASTER, VIEW_DOC } from './prompts.ts';
 import { cachePayload, record } from './cache.ts';
 import { asUser, boundedMessage, buildContext, logMessage, previousExchange, REPORT_TYPE, RUN_BOUNDARY, textContent, typedText } from './transcript.ts';
@@ -140,7 +140,12 @@ export default function optchat(pi: ExtensionAPI) {
     // but blocking dialogs there hang the host. Always take the automatic fallback.
     if (ctx.mode !== 'tui') {
       const names = listProfiles();
-      const fallback = lastProfile() ?? (names.length === 1 ? names[0] : undefined);
+      // Skip profiles another Pi currently holds: opening one would just degrade again and loop.
+      const free = [];
+      for (const name of names) {
+        try { if (await probeProfile(name)) free.push(name); } catch { /* socket-path or env problems: treat as unavailable */ }
+      }
+      const fallback = free.find(n => n === lastProfile()) ?? (free.length === 1 ? free[0] : undefined);
       if (fallback) return fallback;
       // First headless use: create a default profile instead of silently absorbing input.
       createProfile('default');

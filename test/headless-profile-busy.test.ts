@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import optchat from '../src/index.ts';
-import { createProfile, loadConfig, lockProfile, profilePath, profileSocket, saveConfig, SOCKET_PATH_LIMIT } from '../src/profiles.ts';
+import { createProfile, loadConfig, lockProfile, profilePath, profileSocket, rememberProfile, saveConfig, SOCKET_PATH_LIMIT } from '../src/profiles.ts';
 
 const agentDir = process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'optchat-headless-agent-'));
 after(() => rmSync(agentDir, { recursive: true, force: true }));
@@ -35,7 +35,8 @@ async function start(dir: string, mode: 'print' | 'rpc', bound?: string, uiOverr
 }
 
 test('a headless session whose profile is busy degrades to a plain session instead of faulting', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'optchat-headless-'));
+  // Short OPTCHAT_HOME: the lock-socket path has a 103-byte limit on darwin, deep tmpdirs overflow it.
+  const dir = mkdtempSync('/tmp/oc-h-');
   const oldHome = process.env.OPTCHAT_HOME;
   process.env.OPTCHAT_HOME = join(dir, 'home');
   let session: Awaited<ReturnType<typeof start>>['session'] | undefined;
@@ -74,6 +75,38 @@ test('a headless session whose profile is busy degrades to a plain session inste
     const rpcUnlocked = await start(dir, 'rpc', undefined, noSelect);
     session = rpcUnlocked.session;
     assert.deepEqual(rpcUnlocked.errors, [], 'rpc session with a single unlocked profile must auto-select it, not fault');
+  } finally {
+    if (session) { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
+    await unlock?.();
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a non-tui session skips a locked profile and picks a free one instead of degrading into a loop', async () => {
+  // The IDE loop: lastProfile is locked by the parent (terminal Pi), so the fallback
+  // must not keep returning it — /optchat profile would re-open the same busy profile.
+  const dir = mkdtempSync('/tmp/oc-h-');
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = join(dir, 'home');
+  let session: Awaited<ReturnType<typeof start>>['session'] | undefined;
+  let unlock: (() => Promise<void>) | undefined;
+  try {
+    for (const name of ['work', 'personal']) {
+      createProfile(name);
+      const config = loadConfig(profilePath(name));
+      saveConfig(profilePath(name), { ...config, compactor: { provider: 'fixture', model: 'fixture', thinking: 'off' }, subagent: { provider: 'fixture', model: 'fixture', thinking: 'off' } });
+    }
+    rememberProfile('work');
+    unlock = await lockProfile(profilePath('work'), 'work · PID 1 · elsewhere');
+
+    const noSelect = (ctx: ExtensionUIContext): ExtensionUIContext => ({ ...ctx,
+      select: async () => { throw new Error('blocking ui.select must not be called in rpc mode'); } });
+    const rpc = await start(dir, 'rpc', undefined, noSelect);
+    session = rpc.session;
+    assert.deepEqual(rpc.errors, [], 'rpc session with locked lastProfile must pick the free profile, not degrade or fault');
+    const bindings = rpc.manager.getEntries().filter(e => e.type === 'custom' && e.customType === 'optchat.profile');
+    assert.deepEqual(bindings.map(e => (e as any).data), [{ name: 'personal' }], 'the free profile must be bound: ' + JSON.stringify(bindings));
   } finally {
     if (session) { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
     await unlock?.();
