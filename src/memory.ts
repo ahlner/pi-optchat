@@ -35,8 +35,8 @@ export function cap(text: string, limit = CAP) {
   const tail = text.slice(/[\udc00-\udfff]/.test(text[text.length - half]) ? text.length - half + 1 : text.length - half);
   return head + notice(text.length - head.length - tail.length) + tail;
 }
-/** Text over `limit`, other than a tool's clipped output, is logged as several messages in a row, never cut (recipe §1).
- * A piece ends after its last line break when that falls in its second half, and never splits a surrogate pair. */
+/** `text` in pieces of at most `limit`. A piece ends after its last line break when that falls in its second half, and never
+ * splits a surrogate pair. */
 export function pieces(text: string, limit = PIECE) {
   const result: string[] = [];
   while (text.length > limit) {
@@ -45,6 +45,15 @@ export function pieces(text: string, limit = PIECE) {
     result.push(text.slice(0, at)); text = text.slice(at);
   }
   return [...result, text];
+}
+/** The messages a text is logged as (recipe §1): a tool's output is clipped, and any other text over PIECE is split over
+ * several in a row, never cut. A report's `[id] ` tag starts each piece, so none reads as the user's words; the last piece
+ * holds the receipt. */
+export function asMessages<T extends { kind: Kind; text: string; receipt?: string }>(message: T): T[] {
+  if (message.kind === 'echo') return [{ ...message, text: cap(message.text, PIECE) }];
+  const tag = message.kind === 'user' ? /^\[[^\]\s]+\] /.exec(message.text)?.[0] ?? '' : '';
+  const all = pieces(message.text.slice(tag.length), PIECE - tag.length);
+  return all.map((text, j) => ({ ...message, text: tag + text, receipt: j === all.length - 1 ? message.receipt : undefined }));
 }
 export function localDay(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -201,12 +210,11 @@ export class Memory {
     const main = dirname(next), names = readdirSync(main).filter(n => n.endsWith('.jsonl'));
     if (names.length !== this.lastSeenBytes.size || names.some(n => statSync(join(main, n)).size !== this.lastSeenBytes.get(join(main, n)))) throw otherWriter(next);
   }
-  /** Long text becomes several entries in a row, written at once; a tool's output is clipped instead (recipe §1). The last entry holds the receipt. */
+  /** Logs `text` as `asMessages` splits it, all in one write. Returns the last entry. */
   append(kind: Kind, text: string, date = new Date().toISOString(), receipt?: string, origin?: Origin) {
     if (this.stopped) throw new Error('Memory is closed.');
-    const all = kind === 'echo' ? [text] : pieces(text);
-    const entries: Entry[] = all.map((piece, j) => ({ i: this.root.length + j, kind, text: piece, date, size: bytes(`${kind}: ${piece}`),
-      ...(receipt && j === all.length - 1 ? { receipt } : {}), ...(origin ? { origin } : {}) }));
+    const entries: Entry[] = asMessages({ kind, text, receipt }).map((message, j) => ({ i: this.root.length + j, kind, text: message.text, date,
+      size: bytes(`${kind}: ${message.text}`), ...(message.receipt ? { receipt: message.receipt } : {}), ...(origin ? { origin } : {}) }));
     const file = join(this.directory, 'main', `${localDay()}.jsonl`);
     if (!this.lastSeenBytes.has(file)) this.checkLog(file);
     this.lastSeenBytes.set(file, appendLines(file, entries, this.lastSeenBytes.get(file) ?? 0));

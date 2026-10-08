@@ -40,7 +40,7 @@ export function logMessage(memory: Memory, message: AgentMessage, receipt?: stri
     }
     if (message.stopReason === 'error' || message.stopReason === 'aborted')
       memory.append('echo', `Agent ${message.stopReason}: ${message.errorMessage ?? 'No further details'}`, date);
-  } else if (message.role === 'toolResult') memory.append('echo', cap(`${message.toolName}: ${textContent(message.content)}`), date);
+  } else if (message.role === 'toolResult') memory.append('echo', `${message.toolName}: ${textContent(message.content)}`, date);
 }
 export function boundedMessage(message: AgentMessage): AgentMessage {
   if (message.role !== 'toolResult') return message;

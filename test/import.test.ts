@@ -477,8 +477,31 @@ test('a long imported message is planned as several messages in a row, as a live
       assert.equal(memory.root.at(-1)?.text, 'Imported after');
       assert.equal(memory.root.length, job.total, 'one planned entry per logged message, so an interrupted import resumes at the right one');
       assert.equal(deduplicate(memory.root, [entry('long', date, text)]).skipped, 1);
+      assert.equal(deduplicate(memory.root, [{ ...entry('long', date, text), receipt: 'import:copy' }]).skipped, 1, 'a copy in another file matches the pieces whole');
     } finally { await memory.close(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a rebuild plans the old log\'s long messages as pieces too, so an interrupted rebuild resumes', async () => {
+  const dir = temp(), long = 'o'.repeat(40_000);
+  mkdirSync(join(dir, 'main'), { recursive: true });
+  // A log from before long text was split.
+  lines(join(dir, 'main', '2026-01-01.jsonl'), [{ i: 0, kind: 'user', text: long, date: '2026-01-01T00:00:00.000Z' }]);
+  const old = new Memory(dir, short);
+  let memory: Memory | undefined;
+  try {
+    await old.close();
+    const job = prepareImport(dir, old, [entry('a')], 'rebuild'); assert.ok(job);
+    assert.equal(job.total, 3);
+    await assert.rejects(runImport(dir, async (_input, signal) => {
+      await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+      return '';
+    }, AbortSignal.timeout(50)));
+    await runImport(dir, short, AbortSignal.timeout(5000));
+    memory = new Memory(memoryDirectory(dir), short);
+    assert.equal(memory.root.length, job.total);
+    assert.equal(memory.root.filter(e => !e.origin).map(e => e.text).join(''), long);
+  } finally { await memory?.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('a staged plan with an invalid entry, or missing lines, is refused before anything is written', async () => {

@@ -707,6 +707,31 @@ test('zoom gives each piece of a long text with no line breaks whole, within the
   } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('each piece of a long subagent report starts with its tag, so none reads as the user\'s words', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-report-pieces-'));
+  const memory = new Memory(dir, async () => 'summary', () => {}, 1_000_000);
+  try {
+    const report = 'r'.repeat(70_000);
+    memory.append('user', `[abc12345] ${report}`, undefined, 'input-1');
+    assert.equal(memory.root.length, 3);
+    assert.ok(memory.root.every(e => e.text.startsWith('[abc12345] ') && e.text.length <= PIECE));
+    assert.equal(memory.root.map(e => e.text.slice('[abc12345] '.length)).join(''), report);
+    assert.equal(memory.root.at(-1)?.receipt, 'input-1');
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('zoom gives a clipped tool output whole, so the model sees how much was omitted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-zoom-echo-'));
+  const memory = new Memory(dir, async () => 'summary', () => {}, 1_000_000);
+  try {
+    logMessage(memory, { role: 'toolResult', toolCallId: 'c', toolName: 'read', content: [{ type: 'text', text: 'w'.repeat(70_000) }], isError: false, timestamp: 0 });
+    const text = memory.zoom(0, 1);
+    const result: ToolResultMessage = { role: 'toolResult', toolCallId: 'c', toolName: 'zoom', content: [{ type: 'text', text }], isError: false, timestamp: 0 };
+    assert.deepEqual(boundedMessage(result), result, 'zoom(0, 1) reaches the model uncut');
+    assert.match(text, /\[40\d{3} characters omitted/);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('the pieces of a long text are written at once, so a failure after one write cannot log only some of them', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-pieces-at-once-'));
   let memory = new Memory(dir, async () => 'summary', () => {}, 1_000_000);

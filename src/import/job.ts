@@ -1,8 +1,7 @@
 import { existsSync, readFileSync, rmSync, cpSync, mkdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Memory, bytes, isEntry, pieces, type Entry, type Compressor } from '../memory.ts';
-import { atomicWrite } from '../memory.ts';
+import { Memory, asMessages, atomicWrite, bytes, isEntry, type Entry, type Compressor } from '../memory.ts';
 import { record } from '../cache.ts';
 import { copyKey, type ImportedEntry } from './sources.ts';
 
@@ -38,9 +37,19 @@ export function pendingImport(dir: string): ImportJob | undefined {
   return { id: j.id, mode: j.mode === 'append' ? 'append' : 'rebuild', previous: j.previous, target: `memories/${j.id}`,
     created: j.created, added: Number(j.added), skipped: Number(j.skipped), total: Number(j.total), inputBytes: Number(j.inputBytes) };
 }
+/** Imported messages as they were before `asMessages` split them: an imported piece without the receipt continues into the next. */
+function whole(entries: readonly Entry[]) {
+  const result: Entry[] = [];
+  for (const [j, entry] of entries.entries()) {
+    const previous = entries[j - 1];
+    if (previous?.origin && !previous.receipt) result.push({ ...entry, text: result.pop()!.text + entry.text });
+    else result.push(entry);
+  }
+  return result;
+}
 export function deduplicate(existing: readonly Entry[], incoming: readonly ImportedEntry[]) {
   const receipts = new Set(existing.map(e => e.receipt).filter(Boolean));
-  const copies = new Set(existing.map(copyKey).filter(Boolean));
+  const copies = new Set(whole(existing).map(copyKey).filter(Boolean));
   const added: ImportedEntry[] = []; let skipped = 0;
   for (const entry of incoming) {
     if (!entry.receipt?.startsWith('import:')) throw new Error('Imported entry has no stable source identity.');
@@ -70,9 +79,8 @@ export function prepareImport(dir: string, old: Memory, incoming: readonly Impor
   if (!added.length) return undefined;
   const id = randomUUID(), target = `memories/${id}`, path = generationPath(dir, target);
   // Append copies existing summaries without changing their indices. Rebuild regenerates every node.
-  // Split as Memory.append splits live text, so each planned entry is one message and the plan's indices are the log's.
-  const split = added.flatMap(e => pieces(e.text).map((text, j, all) => ({ ...e, text, receipt: j === all.length - 1 ? e.receipt : undefined })));
-  const all = mode === 'rebuild' ? chronological([...old.root, ...split]) : [...old.root, ...chronological(split)];
+  // Planned as Memory.append logs them, so each planned entry is one message and the plan's indices are the log's.
+  const all = mode === 'rebuild' ? chronological([...old.root, ...added]).flatMap(asMessages) : [...old.root, ...chronological(added).flatMap(asMessages)];
   const entries: Entry[] = all.map((e, i) => ({ ...e, i, size: bytes(`${e.kind}: ${e.text}`) }));
   const kept = mode === 'append' ? old.root.length : 0;
   for (const sub of ['main', 'tree']) mkdirSync(join(path, sub), { recursive: true, mode: 0o700 });
