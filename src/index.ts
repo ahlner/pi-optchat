@@ -136,7 +136,9 @@ export default function optchat(pi: ExtensionAPI) {
   };
   const CONNECT = 'Start a connected subagent conversation here', BACK = 'Back';
   const chooseProfile = async (ctx: ExtensionContext): Promise<string | undefined> => {
-    if (!ctx.hasUI) {
+    // Non-TUI sessions (headless -p, RPC hosts like pi-acp) can carry a real uiContext,
+    // but blocking dialogs there hang the host. Always take the automatic fallback.
+    if (ctx.mode !== 'tui') {
       const names = listProfiles();
       const fallback = lastProfile() ?? (names.length === 1 ? names[0] : undefined);
       if (fallback) return fallback;

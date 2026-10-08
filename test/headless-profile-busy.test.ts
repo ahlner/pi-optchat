@@ -10,7 +10,7 @@ import { createProfile, loadConfig, lockProfile, profilePath, profileSocket, sav
 const agentDir = process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'optchat-headless-agent-'));
 after(() => rmSync(agentDir, { recursive: true, force: true }));
 
-async function start(dir: string, mode: 'print', bound?: string) {
+async function start(dir: string, mode: 'print' | 'rpc', bound?: string, uiOverride?: (ctx: ExtensionUIContext) => ExtensionUIContext) {
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null,
     modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
   runtime.registerProvider('fixture', {
@@ -27,8 +27,9 @@ async function start(dir: string, mode: 'print', bound?: string) {
   const { session } = await createAgentSession({ modelRuntime: runtime, model: runtime.getModel('fixture', 'fixture'),
     resourceLoader: loader, settingsManager, sessionManager: manager, tools: ['zoom'] });
   const errors: string[] = [], notifications: string[] = [];
-  const uiContext: ExtensionUIContext = { ...session.extensionRunner.getUIContext(),
+  const base: ExtensionUIContext = { ...session.extensionRunner.getUIContext(),
     notify: (text, type) => { notifications.push(text); if (type === 'error') errors.push(text); } };
+  const uiContext: ExtensionUIContext = uiOverride ? uiOverride(base) : base;
   await session.bindExtensions({ uiContext, mode });
   return { session, errors, notifications, manager };
 }
@@ -49,7 +50,6 @@ test('a headless session whose profile is busy degrades to a plain session inste
     // profile must degrade instead of throwing out of session_start. Before the fix
     // this faulted the session and the runner's prompt was aborted.
     const headless = await start(dir, 'print', 'busy');
-    console.error('DBG-A errors=' + JSON.stringify(headless.errors) + ' notes=' + JSON.stringify(headless.notifications))
     session = headless.session;
     assert.deepEqual(headless.errors, [], 'session_start must not fault when the profile is busy in headless mode');
     assert.deepEqual(headless.notifications, [], 'no noise expected either');
@@ -61,6 +61,19 @@ test('a headless session whose profile is busy degrades to a plain session inste
     assert.deepEqual(bindings.map(e => (e as any).data), [{ name: 'busy' }], 'the pre-set binding stays; degradation must not add or change bindings: ' + JSON.stringify(bindings));
     const title = headless.session.extensionRunner.getUIContext();
     assert.ok(title, 'extension ui context survives degradation');
+
+    // RPC mode (pi-acp / IDE hosts) carries a real uiContext, so hasUI is true —
+    // but a blocking ui.select there hangs the host. It must take the automatic
+    // fallback instead of prompting.
+    const noSelect = (ctx: ExtensionUIContext): ExtensionUIContext => ({ ...ctx,
+      select: async () => { throw new Error('blocking ui.select must not be called in rpc mode'); } });
+    const rpcBusy = await start(dir, 'rpc', 'busy', noSelect);
+    session = rpcBusy.session;
+    assert.deepEqual(rpcBusy.errors, [], 'a busy profile must degrade in rpc mode too, not fault or prompt');
+
+    const rpcUnlocked = await start(dir, 'rpc', undefined, noSelect);
+    session = rpcUnlocked.session;
+    assert.deepEqual(rpcUnlocked.errors, [], 'rpc session with a single unlocked profile must auto-select it, not fault');
   } finally {
     if (session) { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
     await unlock?.();
