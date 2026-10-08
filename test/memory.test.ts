@@ -1,10 +1,13 @@
 import { mock, test } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, appendFileSync, writeFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Memory, appendJson, cap, CAP, start, end, bytes, localDay, mostDue, type Compression, type Part } from '../src/memory.ts';
+import { Memory, appendJson, cap, CAP, PIECE, start, end, bytes, localDay, mostDue, pieces as split, type Compression, type Part } from '../src/memory.ts';
 import { lockProfile } from '../src/profiles.ts';
+import { COMPACT, VIEW_DOC } from '../src/prompts.ts';
 import { splitView, cachePayload } from '../src/cache.ts';
 import { logMessage, buildContext, boundedMessage } from '../src/transcript.ts';
 import { Inbox } from '../src/inbox.ts';
@@ -617,6 +620,80 @@ test('cap states exactly how many characters it omitted and stays within the lim
     assert.ok(text.startsWith(head) && text.endsWith(tail));
     assert.equal(claimed, text.length - head.length - tail.length);
   }
+});
+
+test('long text splits into pieces of at most CAP characters that join back exactly, after a line break when one is near', () => {
+  assert.deepEqual(split('short'), ['short']);
+  const lines = Array.from({ length: 2000 }, (_, i) => `line ${i} ${'x'.repeat(40)}`).join('\n');
+  const parts = split(lines);
+  assert.equal(parts.join(''), lines);
+  assert.ok(parts.length === 4 && parts.every(p => p.length <= PIECE));
+  assert.ok(parts.slice(0, -1).every(p => p.endsWith('\n')), 'each piece ends after a line break');
+  const flat = '😀'.repeat(CAP);
+  const emoji = split(flat);
+  assert.equal(emoji.join(''), flat);
+  assert.ok(emoji.every(p => p.length <= PIECE && !/^[\udc00-\udfff]|[\ud800-\udbff]$/.test(p)), 'no piece starts or ends inside a surrogate pair');
+});
+
+test('long text is logged as several messages in a row, never cut, while a tool\'s output is still clipped', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-split-'));
+  const memory = new Memory(dir, async () => 'summary', () => {}, 1_000_000);
+  try {
+    const paste = Array.from({ length: 2000 }, (_, i) => `row ${i}: ${'y'.repeat(20)}`).join('\n'); // about 61,000 characters
+    logMessage(memory, { role: 'user', content: paste, timestamp: 0 }, 'input-1');
+    const reply: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: 'z'.repeat(45_000) }], api: 'anthropic-messages', provider: 'p', model: 'm',
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: 'stop', timestamp: 0 };
+    logMessage(memory, reply);
+    const result: ToolResultMessage = { role: 'toolResult', toolCallId: 'c', toolName: 'read', content: [{ type: 'text', text: 'w'.repeat(70_000) }], isError: false, timestamp: 0 };
+    logMessage(memory, result);
+    const users = memory.root.filter(e => e.kind === 'user'), talks = memory.root.filter(e => e.kind === 'talk'), echoes = memory.root.filter(e => e.kind === 'echo');
+    assert.equal(users.map(e => e.text).join(''), paste);
+    assert.ok(users.length === 3 && users.every(e => e.text.length <= PIECE));
+    assert.deepEqual(users.map(e => e.receipt), [undefined, undefined, 'input-1'], 'only the last piece claims the input');
+    assert.deepEqual(talks.map(e => e.text.length), [PIECE, 45_000 - PIECE]);
+    assert.equal(echoes.length, 1); assert.match(echoes[0].text, /characters omitted/);
+    assert.deepEqual(memory.root.map(e => e.i), memory.root.map((_, i) => i));
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('zoom gives each piece of a long text with no line breaks whole, within the tool output cap', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-zoom-piece-'));
+  const memory = new Memory(dir, async () => 'summary', () => {}, 1_000_000);
+  try {
+    const paste = 'z'.repeat(70_000);
+    memory.append('user', paste);
+    assert.equal(memory.root.length, 3);
+    for (const entry of memory.root) {
+      const text = memory.zoom(entry.i, 1);
+      const result: ToolResultMessage = { role: 'toolResult', toolCallId: 'c', toolName: 'zoom', content: [{ type: 'text', text }], isError: false, timestamp: 0 };
+      assert.deepEqual(boundedMessage(result), result, `zoom(${entry.i}, 1) reaches the model uncut`);
+    }
+    assert.equal(memory.root.map(e => e.text).join(''), paste);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the pieces of a long text are written at once, so a failure after one write cannot log only some of them', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-pieces-at-once-'));
+  let memory = new Memory(dir, async () => 'summary', () => {}, 1_000_000);
+  const original = fs.writeSync;
+  let writes = 0;
+  const patched = mock.method(fs, 'writeSync', (...args: Parameters<typeof fs.writeSync>) => {
+    if (++writes > 1) throw new Error('disk gone');
+    return (original as (...a: unknown[]) => number)(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    try { memory.append('user', 'q'.repeat(70_000), undefined, 'input-1'); } catch { /* the simulated failure */ }
+    patched.mock.restore(); syncBuiltinESMExports();
+    await memory.close();
+    memory = new Memory(dir, async () => 'summary', () => {}, 1_000_000);
+    assert.equal(memory.root.length, 3, 'all three pieces were logged');
+    assert.equal(memory.root.at(-1)?.receipt, 'input-1');
+  } finally { patched.mock.restore(); syncBuiltinESMExports(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the view doc and the compactor prompt say that long text is split over several messages, in the recipe\'s words', () => {
+  for (const prompt of [VIEW_DOC, COMPACT]) assert.ok(prompt.replace(/\n/g, ' ').includes('A text too long for one message is split over several in a row.'));
 });
 
 test('cap never cuts a surrogate pair in half', () => {

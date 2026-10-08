@@ -5,6 +5,8 @@ import { EventEmitter } from 'node:events';
 export const NODE = 512;
 export const VIEW = 128_000;
 export const CAP = 30_000;
+/** The longest piece of a split text: CAP less room for zoom's `id+0|kind: ` head, so a zoomed piece reaches the model whole. */
+export const PIECE = CAP - 100;
 export type Kind = 'user' | 'talk' | 'tool' | 'echo' | 'note';
 export interface Origin { source: 'claude' | 'claude-memory' | 'codex' | 'chatgpt'; conversation: string; message: string; title: string; project?: string }
 export interface Entry { i: number; kind: Kind; text: string; size: number; date: string; receipt?: string; origin?: Origin }
@@ -33,6 +35,17 @@ export function cap(text: string, limit = CAP) {
   const tail = text.slice(/[\udc00-\udfff]/.test(text[text.length - half]) ? text.length - half + 1 : text.length - half);
   return head + notice(text.length - head.length - tail.length) + tail;
 }
+/** Text over `limit`, other than a tool's clipped output, is logged as several messages in a row, never cut (recipe §1).
+ * A piece ends after its last line break when that falls in its second half, and never splits a surrogate pair. */
+export function pieces(text: string, limit = PIECE) {
+  const result: string[] = [];
+  while (text.length > limit) {
+    let at = text.lastIndexOf('\n', limit - 1) + 1;
+    if (at <= limit / 2) at = /[\ud800-\udbff]/.test(text[limit - 1]) ? limit - 1 : limit;
+    result.push(text.slice(0, at)); text = text.slice(at);
+  }
+  return [...result, text];
+}
 export function localDay(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
@@ -60,13 +73,15 @@ export function mostDue(view: readonly Part[], total: number, built: (part: Part
 }
 const otherWriter = (file: string) => new Error(`Another process wrote ${file}. Close every other Pi on this profile and restart Pi; nothing was written.`);
 /** With `size`, refuses to append unless the file still has that size. A last line left without its newline is ended first. Returns the new size. */
-export function appendJson(file: string, value: unknown, size?: number) {
+export function appendJson(file: string, value: unknown, size?: number) { return appendLines(file, [value], size); }
+/** Appends every value in one write, so a crash leaves all of them or none. */
+export function appendLines(file: string, values: readonly unknown[], size?: number) {
   const fd = openSync(file, 'a+', 0o600);
   try {
     const length = fstatSync(fd).size, last = Buffer.alloc(1);
     if (size !== undefined && length !== size) throw otherWriter(file);
     const torn = length > 0 && readSync(fd, last, 0, 1, length - 1) === 1 && last[0] !== 0x0a;
-    const data = Buffer.from((torn ? '\n' : '') + JSON.stringify(value) + '\n');
+    const data = Buffer.from((torn ? '\n' : '') + values.map(value => JSON.stringify(value) + '\n').join(''));
     if (writeSync(fd, data) !== data.length) throw new Error(`Incomplete write: ${file}`);
     fsyncSync(fd);
     return fstatSync(fd).size;
@@ -156,14 +171,18 @@ export class Memory {
     const main = dirname(next), names = readdirSync(main).filter(n => n.endsWith('.jsonl'));
     if (names.length !== this.lastSeenBytes.size || names.some(n => statSync(join(main, n)).size !== this.lastSeenBytes.get(join(main, n)))) throw otherWriter(next);
   }
+  /** Long text becomes several entries in a row, written at once; a tool's output is clipped instead (recipe §1). The last entry holds the receipt. */
   append(kind: Kind, text: string, date = new Date().toISOString(), receipt?: string, origin?: Origin) {
     if (this.stopped) throw new Error('Memory is closed.');
-    const entry: Entry = { i: this.root.length, kind, text, date, size: bytes(`${kind}: ${text}`), ...(receipt ? { receipt } : {}), ...(origin ? { origin } : {}) };
+    const all = kind === 'echo' ? [text] : pieces(text);
+    const entries: Entry[] = all.map((piece, j) => ({ i: this.root.length + j, kind, text: piece, date, size: bytes(`${kind}: ${piece}`),
+      ...(receipt && j === all.length - 1 ? { receipt } : {}), ...(origin ? { origin } : {}) }));
     const file = join(this.directory, 'main', `${localDay()}.jsonl`);
     if (!this.lastSeenBytes.has(file)) this.checkLog(file);
-    this.lastSeenBytes.set(file, appendJson(file, entry, this.lastSeenBytes.get(file) ?? 0));
-    this.root.push(entry); this.push(entry.i); this.fit(); this.save(); this.schedule();
-    return entry;
+    this.lastSeenBytes.set(file, appendLines(file, entries, this.lastSeenBytes.get(file) ?? 0));
+    for (const entry of entries) { this.root.push(entry); this.push(entry.i); this.fit(); }
+    this.save(); this.schedule();
+    return entries.at(-1)!;
   }
   node(part: Part) { return this.tree.get(key(part)); }
   private text(part: Part) { return this.node(part)?.text ?? UNBUILT; }

@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { Memory, localDay, type Compressor } from '../src/memory.ts';
+import { Memory, PIECE, localDay, type Compressor } from '../src/memory.ts';
 import { scanLocal, scanChatGPT, scanClaudeMemories, readConversation, timestamp, type Conversation, type ImportedEntry } from '../src/import/sources.ts';
 import { prepareImport, runImport, memoryDirectory, pendingImport, discardImport, deduplicate, chronological } from '../src/import/job.ts';
 import { chooseImport, showProgress } from '../src/import/ui.ts';
@@ -458,6 +458,27 @@ test('an import gives the compactor the same inputs as a live chat that sent the
     assert.ok(fromChat.some(call => call.startsWith('[true')), 'the view overflowed and merged');
     assert.deepEqual(fromImport.sort(), fromChat.sort());
   } finally { await chat?.close(); rmSync(dir, { recursive: true, force: true }); rmSync(live, { recursive: true, force: true }); }
+});
+
+test('a long imported message is planned as several messages in a row, as a live chat logs it, and is not imported twice', async () => {
+  const dir = temp(), old = new Memory(dir, short);
+  const text = Array.from({ length: 3000 }, (_, i) => `imported row ${i}: ${'v'.repeat(20)}`).join('\n');
+  try {
+    old.append('user', 'original'); await old.settle(undefined, true); await old.close();
+    const job = prepareImport(dir, old, [entry('long', date, text), entry('after')], 'append'); assert.ok(job);
+    assert.equal(job.added, 2);
+    await runImport(dir, short, AbortSignal.timeout(20000));
+    const memory = new Memory(memoryDirectory(dir), short);
+    try {
+      const long = memory.root.filter(e => e.origin?.message === 'long');
+      assert.ok(long.length > 1 && long.every(e => e.text.length <= PIECE));
+      assert.equal(long.map(e => e.text).join(''), text);
+      assert.deepEqual(long.map(e => e.receipt), [...long.slice(1).map(() => undefined), 'import:long']);
+      assert.equal(memory.root.at(-1)?.text, 'Imported after');
+      assert.equal(memory.root.length, job.total, 'one planned entry per logged message, so an interrupted import resumes at the right one');
+      assert.equal(deduplicate(memory.root, [entry('long', date, text)]).skipped, 1);
+    } finally { await memory.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('a staged plan with an invalid entry, or missing lines, is refused before anything is written', async () => {

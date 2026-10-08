@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync, cpSync, mkdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Memory, bytes, isEntry, type Entry, type Compressor } from '../memory.ts';
+import { Memory, bytes, isEntry, pieces, type Entry, type Compressor } from '../memory.ts';
 import { atomicWrite } from '../memory.ts';
 import { record } from '../cache.ts';
 import { copyKey, type ImportedEntry } from './sources.ts';
@@ -70,7 +70,9 @@ export function prepareImport(dir: string, old: Memory, incoming: readonly Impor
   if (!added.length) return undefined;
   const id = randomUUID(), target = `memories/${id}`, path = generationPath(dir, target);
   // Append copies existing summaries without changing their indices. Rebuild regenerates every node.
-  const all = mode === 'rebuild' ? chronological([...old.root, ...added]) : [...old.root, ...chronological(added)];
+  // Split as Memory.append splits live text, so each planned entry is one message and the plan's indices are the log's.
+  const split = added.flatMap(e => pieces(e.text).map((text, j, all) => ({ ...e, text, receipt: j === all.length - 1 ? e.receipt : undefined })));
+  const all = mode === 'rebuild' ? chronological([...old.root, ...split]) : [...old.root, ...chronological(split)];
   const entries: Entry[] = all.map((e, i) => ({ ...e, i, size: bytes(`${e.kind}: ${e.text}`) }));
   const kept = mode === 'append' ? old.root.length : 0;
   for (const sub of ['main', 'tree']) mkdirSync(join(path, sub), { recursive: true, mode: 0o700 });
