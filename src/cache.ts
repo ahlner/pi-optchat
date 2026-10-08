@@ -15,8 +15,13 @@ export function splitView(text: string) {
   return pieces;
 }
 
-/** Anthropic: a mark on the view's last whole block plus automatic end-of-request caching. Anthropic looks back 20 blocks
- * from a mark for an earlier entry, so the next call finds this one and pays only for the lines after it. */
+/** How many blocks before the view's last whole one each mark sits. Anthropic looks back only 20 blocks from a mark for an
+ * earlier entry, so the marks 20 and 40 blocks back still find the last call's entry after a turn of tool calls adds up to
+ * 60 blocks (240 lines). With the end of the request, that is Anthropic's limit of 4 marks. */
+const MARKS = [0, 20, 40];
+
+/** Anthropic: marks on the view (see MARKS) plus automatic end-of-request caching, so the next call finds the last one's entry
+ * and pays only for the lines after it. */
 export function cachePayload(payload: unknown): unknown {
   if (!record(payload) || !Array.isArray(payload.messages)) return payload;
   const messages = payload.messages;
@@ -25,14 +30,14 @@ export function cachePayload(payload: unknown): unknown {
     if (!record(message) || message.role !== 'user' || !Array.isArray(message.content)) continue;
     const at = message.content.findIndex((block: unknown) => record(block) && block.type === 'text' && typeof block.text === 'string' && isView(block.text));
     if (at < 0) continue;
-    const pieces = splitView(message.content[at].text);
-    const blocks = pieces.map((text, j) => ({ type: 'text', text, ...(j === pieces.length - 2 ? { cache_control: { type: 'ephemeral' } } : {}) }));
+    const pieces = splitView(message.content[at].text), marked = new Set(MARKS.map(back => pieces.length - 2 - back));
+    const blocks = pieces.map((text, j) => ({ type: 'text', text, ...(marked.has(j) ? { cache_control: { type: 'ephemeral' } } : {}) }));
     message.content.splice(at, 1, ...blocks);
     for (const block of blocks) view.add(block);
     break;
   }
   if (!view.size) return payload;
-  // The recipe's two marks only: Pi's own system, tool and recent-message marks are dropped.
+  // These marks only: Pi's own system, tool and recent-message marks are dropped.
   for (const section of [payload.system, payload.tools]) {
     if (Array.isArray(section)) for (const item of section) if (record(item)) delete item.cache_control;
   }
