@@ -207,7 +207,7 @@ test('a live profile cannot be opened by a second writer; other profiles can run
   const again = await lockProfile(dir, 'after close'); await again(); rmSync(dir, { recursive: true, force: true });
 });
 
-test('the view goes in blocks of 4 lines, with one mark on its last whole block and one at the request\'s end', () => {
+test('the view goes in blocks of 4 lines, with marks on its last whole block, 20 and 40 blocks before it, and at the request\'s end', () => {
   const line = '0+1|summary of a decision\n';
   for (const quoted of [false, true]) {
     const view = '<chat>\n' + line.repeat(2000) + (quoted ? '0+1|the summary quotes </chat> in passing\n' : '') + line.repeat(3500) + '</chat>';
@@ -221,13 +221,23 @@ test('the view goes in blocks of 4 lines, with one mark on its last whole block 
       messages: [{ role: 'user', content: [{ type: 'text', text: view }, { type: 'text', text: 'new question', cache_control: { type: 'ephemeral' } }] }],
     };
     const output = cachePayload(payload) as typeof payload & { cache_control?: unknown };
-    assert.equal((JSON.stringify(output).match(/cache_control/g) ?? []).length, 2, quoted ? 'a quoted closing tag keeps the marks' : 'plain view');
+    assert.equal((JSON.stringify(output).match(/cache_control/g) ?? []).length, 4, quoted ? 'a quoted closing tag keeps the marks' : 'plain view');
     assert.ok(output.system.every(b => !('cache_control' in b)) && !('cache_control' in output.tools[0]));
     const blocks = output.messages[0].content;
-    assert.equal(blocks.findIndex(b => 'cache_control' in b), pieces.length - 2);
+    assert.deepEqual(blocks.flatMap((b, j) => 'cache_control' in b ? [j] : []), [pieces.length - 42, pieces.length - 22, pieces.length - 2]);
     assert.ok(output.cache_control);
     assert.equal(blocks.map(b => b.text).join(''), view + 'new question');
   }
+});
+
+test('after a turn adds up to 60 blocks of lines, a mark of the next call still finds one of the last call\'s within 20 blocks', () => {
+  const line = '0+1|summary of a decision\n', marks = (lines: number) => {
+    const payload = { messages: [{ role: 'user', content: [{ type: 'text', text: '<chat>\n' + line.repeat(lines) + '</chat>' }] }] };
+    return (cachePayload(payload) as typeof payload).messages[0].content.flatMap((b, j) => 'cache_control' in b ? [j] : []);
+  };
+  const found = (added: number) => marks(1000 + added).some(next => marks(1000).some(last => next >= last && next - last <= 20));
+  assert.ok([4, 100, 240].every(found), 'a turn that adds 1, 25 or 60 blocks');
+  assert.ok(!found(400), 'beyond 60 blocks the last entry is out of reach');
 });
 
 test('the most due pair is the one that ended longest ago in its own line size, so the view merges as Taelin\'s rollback push', () => {
