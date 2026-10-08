@@ -277,7 +277,9 @@ test('the view is saved and loaded as it was, and rebuilt only when the saved on
   try {
     for (let i = 0; i < 16; i++) { memory.append('user', `${i} ${'.'.repeat(600)}`); await memory.settle(AbortSignal.timeout(5000), true); }
     const live = parts(memory);
-    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'view.json'), 'utf8')), live);
+    await memory.close();
+    memory = new Memory(dir, compress, () => {}, 3000);
+    assert.deepEqual(parts(memory), live, 'the saved view plus a line per later message is the live view');
     await memory.close();
     // A view the fold would not produce, but a valid tiling: loading keeps it rather than refolding.
     const saved = [[3, 0], [2, 2], [0, 12], [0, 13], [0, 14], [0, 15]];
@@ -286,6 +288,7 @@ test('the view is saved and loaded as it was, and rebuilt only when the saved on
     assert.deepEqual(parts(memory), saved);
     memory.append('user', 'one more');
     assert.deepEqual(parts(memory), [...saved, [0, 16]]);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'view.json'), 'utf8')), saved, 'a line added without a merge is not saved');
     await memory.close();
     const warnings: string[] = [];
     writeFileSync(join(dir, 'view.json'), JSON.stringify([[0, 0], [0, 2]]));
@@ -343,6 +346,19 @@ test('a message\'s node starts once fewer than 8 lines before it are unbuilt, so
     assert.deepEqual(calls.slice(9).filter(c => !c.input.part.l).map(c => c.input.part.i), [9]);
     calls.forEach(c => c.release());
   } finally { calls.forEach(c => c.release()); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a view that cannot be saved only warns, since the log stays authoritative', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-unsaved-view-')), warnings: string[] = [];
+  mkdirSync(join(dir, 'view.json'), { recursive: true });
+  const memory = new Memory(dir, async () => 's'.repeat(300), text => warnings.push(text), 3000);
+  try {
+    for (let i = 0; i < 16; i++) { memory.append('user', `${i} ${'.'.repeat(600)}`); await memory.settle(AbortSignal.timeout(5000), true); }
+    assert.equal(memory.root.length, 16);
+    assert.ok(memory.view.some(p => p.l > 0), 'the view merged');
+    assert.match(warnings.join('\n'), /Could not save the memory view/);
+    assert.equal(memory.lastError, undefined);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('next turn excludes old conversation; current tool loop and reasoning remain verbatim', async () => {

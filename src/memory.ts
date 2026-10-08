@@ -162,7 +162,7 @@ export class Memory {
     const file = join(this.directory, 'main', `${localDay()}.jsonl`);
     if (!this.lastSeenBytes.has(file)) this.checkLog(file);
     this.lastSeenBytes.set(file, appendJson(file, entry, this.lastSeenBytes.get(file) ?? 0));
-    this.root.push(entry); this.push(entry.i); this.fit(); this.save(); this.schedule();
+    this.root.push(entry); this.push(entry.i); if (this.fit()) this.save(); this.schedule();
     return entry;
   }
   node(part: Part) { return this.tree.get(key(part)); }
@@ -188,7 +188,12 @@ export class Memory {
     for (const part of parts) { this.view.push(part); this.viewBytes += this.partBytes(part); }
     return covered;
   }
-  private save() { atomicWrite(join(this.directory, 'view.json'), JSON.stringify(this.view.map(p => [p.l, p.i]))); }
+  /** Saved when it merges: a view that only grew is the saved one plus a line per later message, as `load` replays it.
+   * The log stays authoritative, so a failed save only warns. */
+  private save() {
+    try { atomicWrite(join(this.directory, 'view.json'), JSON.stringify(this.view.map(p => [p.l, p.i]))); }
+    catch (error) { this.warn(`Could not save the memory view: ${error instanceof Error ? error.message : String(error)}`); }
+  }
   private push(i: number) {
     const part = { l: 0, i };
     this.view.push(part); this.viewBytes += this.partBytes(part);
