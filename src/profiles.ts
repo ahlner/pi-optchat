@@ -60,25 +60,6 @@ export function rememberProfile(name: string) { atomicWrite(join(dataHome(), 'la
 export class ProfileBusyError extends Error {
   constructor(readonly owner: string) { super(`Profile already running: ${owner}`); }
 }
-/** Check whether a profile can be locked right now without actually taking the lock. Fallback pickers use this to skip profiles another Pi holds. */
-export async function probeProfile(name: string): Promise<boolean> {
-  const dir = profilePath(name);
-  if (!existsSync(dir)) return false;
-  const socketPath = profileSocket(dir);
-  checkSocketPath(socketPath);
-  const server = createServer(socket => { socket.on('error', () => socket.destroy()); socket.end(); });
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const failed = (error: Error) => { server.off('listening', ready); reject(error); };
-      const ready = () => { server.off('error', failed); resolve(); };
-      server.once('error', failed); server.once('listening', ready); server.listen(socketPath);
-    });
-    return true;
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'EADDRINUSE') return false;
-    throw error; // socket-path or environment problems are not "busy" — surface them
-  } finally { server.close(); server.unref(); }
-}
 /** Lives in the profile itself, so every Pi on this profile finds the same socket whatever its TMPDIR. Git skips sockets, so checkpoints never see it. */
 export const profileSocket = (dir: string, purpose: 'lock' | 'windows' = 'lock') => join(dir, `${purpose}.sock`);
 

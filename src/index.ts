@@ -9,7 +9,7 @@ import { parseSkillBlock, type ExtensionAPI, type ExtensionContext, type Extensi
 import { Type } from 'typebox';
 import { Memory } from './memory.ts';
 import { createCompressor } from './compactor.ts';
-import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, probeProfile, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
+import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
 import { MASTER, VIEW_DOC } from './prompts.ts';
 import { cachePayload, record } from './cache.ts';
 import { asUser, boundedMessage, buildContext, logMessage, previousExchange, REPORT_TYPE, RUN_BOUNDARY, textContent, typedText } from './transcript.ts';
@@ -136,21 +136,8 @@ export default function optchat(pi: ExtensionAPI) {
   };
   const CONNECT = 'Start a connected subagent conversation here', BACK = 'Back';
   const chooseProfile = async (ctx: ExtensionContext): Promise<string | undefined> => {
-    // Non-TUI sessions (headless -p, RPC hosts like pi-acp) can carry a real uiContext,
-    // but blocking dialogs there hang the host. Always take the automatic fallback.
-    if (ctx.mode !== 'tui') {
-      const names = listProfiles();
-      // Skip profiles another Pi currently holds: opening one would just degrade again and loop.
-      const free = [];
-      for (const name of names) {
-        try { if (await probeProfile(name)) free.push(name); } catch { /* socket-path or env problems: treat as unavailable */ }
-      }
-      const fallback = free.find(n => n === lastProfile()) ?? (free.length === 1 ? free[0] : undefined);
-      if (fallback) return fallback;
-      // First headless use: create a default profile instead of silently absorbing input.
-      createProfile('default');
-      return 'default';
-    }
+    // Outside the TUI (print, json, RPC hosts) never pick or create a profile: a dialog would hang the host, and a guess could write into the wrong memory.
+    if (ctx.mode !== 'tui') return undefined;
     const names = listProfiles(), last = lastProfile();
     if (last) names.sort((a, b) => Number(b === last) - Number(a === last));
     const selected = await ctx.ui.select('OptChat profile', [...names, '+ Create profile']);
@@ -225,25 +212,7 @@ export default function optchat(pi: ExtensionAPI) {
         if (!name) { status(ctx); return; }
         try { await openProfile(name, ctx); break; }
         catch (error) {
-          if (!(error instanceof ProfileBusyError)) {
-            // The bound profile may have been deleted on disk (e.g. `rm -rf ~/.optchat/profiles/…`).
-            // In non-TUI modes that must not kill the session — fall back to a free profile instead.
-            // `settled` sessions are excluded only in TUI, where the user can pick another
-          // profile interactively; in non-TUI hosts (pi -p, ACP) there is no picker, so a
-          // deleted profile must fall back instead of faulting — the prompt would hang otherwise.
-          if (error instanceof Error && /does not exist/.test(error.message) && name === boundName && (!settled || ctx.mode !== 'tui')) {
-              name = await chooseProfile(ctx);
-              continue;
-            }
-            throw error;
-          }
-          if (ctx.mode !== 'tui') {
-            // Headless child (detached runner / pi -p): the profile is locked by its
-            // parent window. Degrade to a plain Pi session instead of faulting —
-            // otherwise session_start throws and the runner's prompt is aborted.
-            status(ctx);
-            return;
-          }
+          if (!(error instanceof ProfileBusyError) || ctx.mode !== 'tui') throw error;
           // A resumed conversation already belongs to this profile, so another profile needs a new session (/optchat profile).
           const choice = await ctx.ui.select(`${name} is open in another window\n${error.owner}`, settled ? [CONNECT] : [CONNECT, BACK]);
           if (choice === CONNECT) { remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text)); fault = undefined; break; }
@@ -254,7 +223,10 @@ export default function optchat(pi: ExtensionAPI) {
       if (name !== boundName) pi.appendEntry(binding, { name });
     } catch (error) {
       if (active) await stop().catch(() => {});
-      fault = errorText(error); ctx.ui.notify(fault, 'error');
+      fault = errorText(error);
+      // Pi reports a throwing handler on stderr (print) or as an extension_error event (RPC); notify there is a no-op or easy to miss.
+      if (ctx.mode !== 'tui') throw error;
+      ctx.ui.notify(fault, 'error');
     }
     // Pi sets its own title once every session_start handler has finished, so put ours back afterwards.
     for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();
@@ -272,12 +244,9 @@ export default function optchat(pi: ExtensionAPI) {
       return { action: 'handled' };
     }
     if (!active) {
-      // Non-TUI hosts (headless, ACP/rpc): never absorb the prompt. Degrade to a plain Pi
-      // session so detached runners, pi -p and IDE sessions still run; optchat features stay
-      // off. An RPC host has a real uiContext, but blocking it here hangs the IDE — notifying
-      // alone cannot unblock, because /optchat profile may fault again in the same cycle.
-      if (ctx.mode === 'tui') { ctx.ui.notify(fault ?? 'Select a profile with /optchat profile before chatting.', 'error'); return { action: 'handled' }; }
-      return { action: 'continue' };
+      // Without a profile or flag, a headless run is plain Pi. A requested profile that failed to open refuses instead of running without memory.
+      if (ctx.mode !== 'tui' && !fault) return { action: 'continue' };
+      ctx.ui.notify(fault ?? 'Select a profile with /optchat profile before chatting.', 'error'); return { action: 'handled' };
     }
     if (importing || pendingImport(active.dir)) { ctx.ui.notify('This profile has an import in progress. Use /optchat import to resume or discard it, or switch profiles.', 'info'); return { action: 'handled' }; }
     if (event.source !== 'extension') {
@@ -298,7 +267,7 @@ export default function optchat(pi: ExtensionAPI) {
     if (active && !runStarted) startRun(ctx);
   });
   pi.on('before_agent_start', (event, ctx) => {
-    if (!active) return; // Headless child without a profile: leave Pi's own prompt untouched.
+    if (!active) return; // Plain Pi run: leave Pi's own prompt untouched.
     startRun(ctx);
     const a = required();
     // Pi's own prompt sections (AGENTS.md files, skills, cwd) stay; the profile's instructions go last.
@@ -333,7 +302,7 @@ export default function optchat(pi: ExtensionAPI) {
   });
   pi.on('context_with_system', async (event, ctx) => {
     try {
-      if (!active) return; // Headless child without a profile: pass context through unmodified.
+      if (!active) return; // Plain Pi run: pass context through unmodified.
       const a = required();
       if (importing || pendingImport(a.dir)) throw new Error('Profile is unavailable while importing.');
       if (fault) throw new Error(fault);
@@ -487,6 +456,7 @@ export default function optchat(pi: ExtensionAPI) {
     }
     if (action === 'profile') {
       if (!ctx.isIdle() || active?.children.active) throw new Error('Finish or stop active work before switching profiles.');
+      if (ctx.mode !== 'tui') throw new Error('/optchat profile requires interactive Pi. Start headless runs with --optchat-profile <name>.');
       const selected = await chooseProfile(ctx);
       if (!selected || selected === active?.name) return;
       await ctx.newSession({ setup: async manager => { manager.appendCustomEntry(binding, { name: selected }); } });
